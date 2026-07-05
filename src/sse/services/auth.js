@@ -543,3 +543,233 @@ export async function withApiKeyLimits(request, innerHandler, clientRawRequest =
   return response;
 }
 
+/**
+ * Detect if a request is from a Claude Code sub-agent.
+ * Ported from router_api/src/logical_HQ_translator/sse_cache_agent.py
+ */
+export function isSubAgentRequest(body) {
+  if (!body) return false;
+
+  let systemPrompt = "";
+
+  // Anthropic format: body.system (string or array of {text:...})
+  if (body.system) {
+    if (typeof body.system === "string") {
+      systemPrompt = body.system;
+    } else if (Array.isArray(body.system)) {
+      systemPrompt = body.system.map(s => s.text || "").join("\n");
+    }
+  }
+
+  // OpenAI format: body.messages[].role === "system" | "developer"
+  if (!systemPrompt && body.messages) {
+    for (const msg of body.messages) {
+      if (msg.role === "system" || msg.role === "developer") {
+        const content = msg.content;
+        if (typeof content === "string") {
+          systemPrompt = content;
+        } else if (Array.isArray(content)) {
+          systemPrompt = content.filter(c => c.type === "text").map(c => c.text).join("\n");
+        }
+        break;
+      }
+    }
+  }
+
+  if (systemPrompt) {
+    const lower = systemPrompt.toLowerCase();
+
+    if (lower.includes("you are an interactive agent")) return false;
+    if (lower.includes("you are claude code")) return true;
+
+    const subAgentKeywords = [
+      "general-purpose agent", "general-purpose assistant",
+      "explore agent", "file search specialist",
+      "exploration task", "read-only exploration",
+      "claude-code-guide", "statusline-setup",
+      "specialized agent", "subagent", "sub-agent",
+      "security monitor",
+      "you are the claude-code-guide", "you are the explore",
+      "you are the general-purpose", "you are the statusline-setup",
+    ];
+    if (subAgentKeywords.some(kw => lower.includes(kw))) return true;
+    if (/you are (a|an|the)[\s\w\-]*sub\.?agent/i.test(systemPrompt)) return true;
+    if (lower.includes("[sub-agent]")) return true;
+
+    const toolCount = (body.tools || []).length;
+    if (toolCount >= 16 && toolCount <= 25) return true;
+  }
+
+  if (body.messages) {
+    for (const msg of body.messages) {
+      if (msg.role !== "user") continue;
+      const content = msg.content;
+      if (typeof content === "string" && content.trim().startsWith("[SUB-AGENT]")) return true;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === "text" && block.text?.trim().startsWith("[SUB-AGENT]")) return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function _anthropicSSE(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function _buildStatusSummary(reason) {
+  const messages = {
+    rate_limit:
+      "⚠️ **[Temporarily Rate Limited]** ⚠️\n\n"
+      + "The system is temporarily rate limited. This is NOT a context error.\n\n"
+      + "**Quick fix:**\n"
+      + "1. Wait 15-30 seconds and retry.\n"
+      + "2. Use `/compact` to reduce context size.",
+    unavailable:
+      "⚠️ **[Service Temporarily Unavailable]** ⚠️\n\n"
+      + "The upstream AI service is temporarily unavailable (503). This is a transient server error.\n\n"
+      + "**Quick fix:**\n"
+      + "1. Wait 30-60 seconds and retry.\n"
+      + "2. The system will automatically retry on the next request.",
+    invalid_key:
+      "⚠️ **[Authentication Error]** ⚠️\n\n"
+      + "Some API keys have billing issues or are invalid. The system has automatically removed them.\n\n"
+      + "**Quick fix:**\n"
+      + "1. Retry now — the system will use a different key.\n"
+      + "2. If the error persists, check your API keys in the dashboard.",
+  };
+  return messages[reason]
+    || "⚠️ **[System Temporarily Overloaded]** ⚠️\n\n"
+    + "All keys/models in the pool are exhausted or rate limited.\n\n"
+    + "**Quick fix:**\n"
+    + "1. Wait 15-30 seconds for rate limits to reset.\n"
+    + "2. Use `/compact` if your context is large (>100K tokens).";
+}
+
+/**
+ * Intercept sub-agent error and return a simulated successful HTTP 200 response.
+ * Prevents Claude Code from crashing when sub-agents encounter errors.
+ * Ported from router_api/src/server/openai_server/auth.py handle_sub_agent_error()
+ */
+export function handleSubAgentError(body, error, sourceFormat) {
+  const errorMsg = String(error?.message || error || "");
+  let reason = "pool_exhausted";
+  if (/rate|limit|quota|429/i.test(errorMsg)) reason = "rate_limit";
+  else if (/503|unavailable|overloaded|frozen/i.test(errorMsg)) reason = "unavailable";
+  else if (/401|unauthorized|api.?key/i.test(errorMsg)) reason = "invalid_key";
+
+  const modelName = body?.model || "unknown";
+  const isStream = body?.stream !== false;
+  const warningText = _buildStatusSummary(reason);
+
+  // Anthropic format detection
+  const isAnthropic = sourceFormat === "claude" || body?.anthropic_version || body?.system;
+
+  if (isAnthropic) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        const msgId = "msg_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const totalLen = JSON.stringify(body?.messages || "").length;
+        const inputTokens = Math.max(1, Math.floor(totalLen / 4));
+        const outputTokens = Math.max(1, Math.floor(warningText.length / 4));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("message_start", {
+          type: "message_start",
+          message: {
+            id: msgId, type: "message", role: "assistant", model: modelName,
+            content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: inputTokens, output_tokens: 0 },
+          }
+        })));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("content_block_start", {
+          type: "content_block_start", index: 0,
+          content_block: { type: "text", text: "" }
+        })));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("content_block_delta", {
+          type: "content_block_delta", index: 0,
+          delta: { type: "text_delta", text: warningText }
+        })));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("content_block_stop", {
+          type: "content_block_stop", index: 0
+        })));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: outputTokens }
+        })));
+
+        controller.enqueue(encoder.encode(_anthropicSSE("message_stop", { type: "message_stop" })));
+        controller.close();
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "anthropic-version": "2023-06-01",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      }
+    });
+  }
+
+  // OpenAI format
+  const chatId = "chatcmpl-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const created = Math.floor(Date.now() / 1000);
+
+  if (isStream) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: " + JSON.stringify({
+          id: chatId, object: "chat.completion.chunk", created, model: modelName,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+        }) + "\n\n"));
+
+        controller.enqueue(encoder.encode("data: " + JSON.stringify({
+          id: chatId, object: "chat.completion.chunk", created, model: modelName,
+          choices: [{ index: 0, delta: { content: warningText }, finish_reason: null }]
+        }) + "\n\n"));
+
+        controller.enqueue(encoder.encode("data: " + JSON.stringify({
+          id: chatId, object: "chat.completion.chunk", created, model: modelName,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+        }) + "\n\n"));
+
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      }
+    });
+  }
+
+  const totalLen = JSON.stringify(body?.messages || "").length;
+  return new Response(JSON.stringify({
+    id: chatId, object: "chat.completion", created, model: modelName,
+    choices: [{ index: 0, message: { role: "assistant", content: warningText }, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: Math.max(1, Math.floor(totalLen / 4)),
+      completion_tokens: Math.max(1, Math.floor(warningText.length / 4)),
+      total_tokens: Math.max(1, Math.floor(totalLen / 4)) + Math.max(1, Math.floor(warningText.length / 4)),
+    }
+  }), {
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  });
+}
+

@@ -26,6 +26,7 @@ import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadr
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+import { isSubAgentRequest, handleSubAgentError } from "@/sse/services/auth.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -276,6 +277,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
     console.log(`${COLORS.red}[ERROR] ${errMsg}${COLORS.reset}`);
+
+    if (isSubAgentRequest(body)) {
+      console.log(`${COLORS.yellow}[SUB-AGENT] intercepting catch error for sub-agent request${COLORS.reset}`);
+      return { success: true, response: handleSubAgentError(body, error, sourceFormat) };
+    }
+
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
   }
 
@@ -319,6 +326,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
     console.log(`${COLORS.red}[ERROR] ${errMsg}${COLORS.reset}`);
     reqLogger.logError(new Error(message), finalBody || translatedBody);
+
+    if (isSubAgentRequest(body)) {
+      console.log(`${COLORS.yellow}[SUB-AGENT] intercepting upstream error for sub-agent request${COLORS.reset}`);
+      return { success: true, response: handleSubAgentError(body, new Error(message), sourceFormat) };
+    }
+
     return createErrorResult(statusCode, errMsg, resetsAtMs);
   }
 
