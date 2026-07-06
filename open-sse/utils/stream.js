@@ -205,7 +205,12 @@ export function createSSEStream(options = {}) {
         // Translate mode
         if (!trimmed) continue;
 
-        const parsed = parseSSELine(trimmed, targetFormat);
+        let parsed;
+        try {
+          parsed = parseSSELine(trimmed, targetFormat);
+        } catch {
+          continue;
+        }
         if (!parsed) continue;
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
@@ -241,95 +246,98 @@ export function createSSEStream(options = {}) {
           continue;
         }
 
-        // Claude format - content
-        if (parsed.delta?.text) {
-          totalContentLength += parsed.delta.text.length;
-          accumulatedContent += parsed.delta.text;
-        }
-        // Claude format - thinking
-        if (parsed.delta?.thinking) {
-          totalContentLength += parsed.delta.thinking.length;
-          accumulatedThinking += parsed.delta.thinking;
-        }
-        
-        // OpenAI format - content
-        if (parsed.choices?.[0]?.delta?.content) {
-          totalContentLength += parsed.choices[0].delta.content.length;
-          accumulatedContent += parsed.choices[0].delta.content;
-        }
-        // OpenAI format - reasoning
-        if (parsed.choices?.[0]?.delta?.reasoning_content) {
-          totalContentLength += parsed.choices[0].delta.reasoning_content.length;
-          accumulatedThinking += parsed.choices[0].delta.reasoning_content;
-        }
-        
-        // Gemini format
-        if (parsed.candidates?.[0]?.content?.parts) {
-          for (const part of parsed.candidates[0].content.parts) {
-            if (part.text && typeof part.text === "string") {
-              totalContentLength += part.text.length;
-              // Check if this is thinking content
-              if (part.thought === true) {
-                accumulatedThinking += part.text;
-              } else {
-                accumulatedContent += part.text;
+        // Wrap translate-mode processing in try-catch so a single bad chunk never
+        // errors the entire TransformStream (which would propagate as controller.error
+        // to the client and crash the request). Safe-by-design: failure to translate
+        // one chunk silently skips it — the rest of the stream continues normally.
+        // eslint bugs: translateResponse, formatSSE, or controller.enqueue can throw
+        // on malformed upstream data, closed streams, or edge cases in translation.
+        try {
+          // Claude format - content
+          if (parsed.delta?.text) {
+            totalContentLength += parsed.delta.text.length;
+            accumulatedContent += parsed.delta.text;
+          }
+          // Claude format - thinking
+          if (parsed.delta?.thinking) {
+            totalContentLength += parsed.delta.thinking.length;
+            accumulatedThinking += parsed.delta.thinking;
+          }
+          
+          // OpenAI format - content
+          if (parsed.choices?.[0]?.delta?.content) {
+            totalContentLength += parsed.choices[0].delta.content.length;
+            accumulatedContent += parsed.choices[0].delta.content;
+          }
+          // OpenAI format - reasoning
+          if (parsed.choices?.[0]?.delta?.reasoning_content) {
+            totalContentLength += parsed.choices[0].delta.reasoning_content.length;
+            accumulatedThinking += parsed.choices[0].delta.reasoning_content;
+          }
+          
+          // Gemini format
+          if (parsed.candidates?.[0]?.content?.parts) {
+            for (const part of parsed.candidates[0].content.parts) {
+              if (part.text && typeof part.text === "string") {
+                totalContentLength += part.text.length;
+                if (part.thought === true) {
+                  accumulatedThinking += part.text;
+                } else {
+                  accumulatedContent += part.text;
+                }
               }
             }
           }
-        }
 
-        // Extract usage
-        const extracted = extractUsage(parsed);
-        if (extracted) state.usage = mergeUsage(state.usage, extracted); // Keep original usage for logging
+          // Extract usage
+          const extracted = extractUsage(parsed);
+          if (extracted) state.usage = mergeUsage(state.usage, extracted);
 
-        // Responses same-format passthrough: re-emit with original event framing
-        if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
-          const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
-          reqLogger?.appendConvertedChunk?.(output);
-          controller.enqueue(sharedEncoder.encode(output));
-          currentOpenAIResponsesEvent = null;
-          sseEmittedCount++;
-          continue;
-        }
-
-        currentOpenAIResponsesEvent = null;
-
-        // Translate: targetFormat -> openai -> sourceFormat
-        const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
-
-        // Log OpenAI intermediate chunks (if available)
-        if (translated?._openaiIntermediate) {
-          for (const item of translated._openaiIntermediate) {
-            const openaiOutput = formatSSE(item, FORMATS.OPENAI);
-            reqLogger?.appendOpenAIChunk?.(openaiOutput);
-          }
-        }
-
-        if (translated?.length > 0) {
-          for (const item of translated) {
-            if (item === null || item === undefined) continue;
-            // Filter empty chunks
-            if (!hasValuableContent(item, sourceFormat)) {
-              continue; // Skip this empty chunk
-            }
-
-            // Inject estimated usage if finish chunk has no valid usage
-            const isFinishChunk = item.type === "message_delta" || item.choices?.[0]?.finish_reason;
-            if (state.finishReason && isFinishChunk && !hasValidUsage(item.usage) && totalContentLength > 0) {
-              const estimated = estimateUsage(body, totalContentLength, sourceFormat);
-              item.usage = filterUsageForFormat(estimated, sourceFormat); // Filter + already has buffer
-              state.usage = estimated;
-            } else if (state.finishReason && isFinishChunk && state.usage) {
-              // Add buffer and filter usage for client (but keep original in state.usage for logging)
-              const buffered = addBufferToUsage(state.usage);
-              item.usage = filterUsageForFormat(buffered, sourceFormat);
-            }
-
-            const output = formatSSE(item, sourceFormat);
+          // Responses same-format passthrough: re-emit with original event framing
+          if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
+            const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
+            currentOpenAIResponsesEvent = null;
             sseEmittedCount++;
+            continue;
           }
+
+          currentOpenAIResponsesEvent = null;
+
+          // Translate: targetFormat -> openai -> sourceFormat
+          const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
+
+          if (translated?._openaiIntermediate) {
+            for (const item of translated._openaiIntermediate) {
+              const openaiOutput = formatSSE(item, FORMATS.OPENAI);
+              reqLogger?.appendOpenAIChunk?.(openaiOutput);
+            }
+          }
+
+          if (translated?.length > 0) {
+            for (const item of translated) {
+              if (item === null || item === undefined) continue;
+              if (!hasValuableContent(item, sourceFormat)) continue;
+
+              const isFinishChunk = item.type === "message_delta" || item.choices?.[0]?.finish_reason;
+              if (state.finishReason && isFinishChunk && !hasValidUsage(item.usage) && totalContentLength > 0) {
+                const estimated = estimateUsage(body, totalContentLength, sourceFormat);
+                item.usage = filterUsageForFormat(estimated, sourceFormat);
+                state.usage = estimated;
+              } else if (state.finishReason && isFinishChunk && state.usage) {
+                const buffered = addBufferToUsage(state.usage);
+                item.usage = filterUsageForFormat(buffered, sourceFormat);
+              }
+
+              const output = formatSSE(item, sourceFormat);
+              reqLogger?.appendConvertedChunk?.(output);
+              controller.enqueue(sharedEncoder.encode(output));
+              sseEmittedCount++;
+            }
+          }
+        } catch (e) {
+          dbg("SSE", `translate error: ${e?.message || e} | provider=${provider} | model=${model}`);
         }
       }
     },
@@ -438,6 +446,17 @@ export function createSSEStream(options = {}) {
           reqLogger?.appendConvertedChunk?.(doneOutput);
           controller.enqueue(sharedEncoder.encode(doneOutput));
           openAIResponsesDoneSent = true;
+          streamDoneSent = true;
+        }
+
+        // Non-Responses translate mode: emit [DONE] sentinel so the client doesn't hang.
+        // In translate mode the upstream format (e.g. Claude) has no [DONE] — the stream
+        // just closes after message_stop. Without this sentinel, OpenAI-format clients
+        // (OpenCode, OpenClaw, OpenAI SDK) hang waiting for the final [DONE] line.
+        if (!keepsOpenAIResponsesFormat && !streamDoneSent) {
+          const doneOutput = "data: [DONE]\n\n";
+          reqLogger?.appendConvertedChunk?.(doneOutput);
+          controller.enqueue(sharedEncoder.encode(doneOutput));
           streamDoneSent = true;
         }
 

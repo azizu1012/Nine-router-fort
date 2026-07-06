@@ -35,7 +35,7 @@ import { isSubAgentRequest, handleSubAgentError } from "@/sse/services/auth.js";
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, abortSignal, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, onStreamError, clientRawRequest, connectionId, userAgent, apiKey, abortSignal, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
 
@@ -202,7 +202,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: (error) => {
+      trackPendingRequest(model, provider, connectionId, false);
+      // Mark the account as unavailable so subsequent requests fallback to
+      // another account/combo model. Without this, a mid-stream failure
+      // leaves the account "healthy" and the next request hits the same
+      // broken connection. Fire-and-forget: the current stream is already
+      // closing, but the next request benefits from the cooldown.
+      if (connectionId && onStreamError) {
+        try { Promise.resolve().then(() => onStreamError(error)).catch(() => {}); } catch {}
+      }
+    },
     log, provider, model
   });
 

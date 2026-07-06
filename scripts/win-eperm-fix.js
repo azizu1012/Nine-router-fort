@@ -19,6 +19,38 @@ if (process.platform === 'win32') {
   // Part 1: Scandir EPERM/EACCES Fix
   // ==========================================
 
+  // Patch readlink (used by @vercel/nft file tracing)
+  const origReadlink = fs.readlink;
+  fs.readlink = function patchedReadlink(p, ...args) {
+    const callback = args[args.length - 1];
+    if (typeof callback === 'function') {
+      const wrappedCallback = function (err, link) {
+        if (err && (err.code === 'EPERM' || err.code === 'EACCES')) {
+          return callback(null, ''); // Return empty string
+        }
+        return callback(err, link);
+      };
+      args[args.length - 1] = wrappedCallback;
+      return origReadlink.call(fs, p, ...args);
+    }
+    return origReadlink.call(fs, p, ...args);
+  };
+
+  // Patch fs.promises.readlink
+  if (fs.promises && fs.promises.readlink) {
+    const origReadlinkPromise = fs.promises.readlink;
+    fs.promises.readlink = async function patchedReadlinkPromise(p, ...args) {
+      try {
+        return await origReadlinkPromise.call(fs.promises, p, ...args);
+      } catch (err) {
+        if (err.code === 'EPERM' || err.code === 'EACCES') {
+          return '';
+        }
+        throw err;
+      }
+    };
+  }
+
   // Patch async readdir (callback-style, used by glob)
   const origReaddir = fs.readdir;
   fs.readdir = function patchedReaddir(p, ...args) {

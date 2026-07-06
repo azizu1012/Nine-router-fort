@@ -278,6 +278,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
+      },
+      onStreamError: async (error) => {
+        const statusCode = error?.status || error?.code || 502;
+        const errorText = error?.message || "stream error";
+        await markAccountUnavailable(credentials.connectionId, statusCode, errorText, provider, model);
       }
     });
 

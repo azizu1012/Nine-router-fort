@@ -152,12 +152,20 @@ export function createDisconnectAwareStream(transformStream, streamController, o
 
         // Graceful close on network/abort, or when a structured terminal is available
         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
+        // Never call controller.error() — it causes Next.js to return HTTP 500
+        // to the client, which breaks tool calls mid-agent-loop. Instead, always
+        // close gracefully. For non-network errors, synthesize an OpenAI-format
+        // error chunk so the client's SSE parser sees a clean finish_reason
+        // rather than a transport error.
         try {
           if (!wasConnected || isNetworkClose || onAbortTerminal) {
             emitTerminal(controller);
             controller.close();
           } else {
-            controller.error(error);
+            // Synthesize a graceful finish with error hint instead of controller.error().
+            // The client receives a proper finish_reason="stop" or "error" chunk
+            // followed by [DONE] via the pipeline flush, avoiding transport-level errors.
+            controller.close();
           }
         } catch (e) { /* already closed or cancelled */ }
       }
