@@ -21,6 +21,7 @@ const nextConfig = {
   outputFileTracingExcludes: {
     "*": [
       "./gitbook/**/*",
+      "**/CherryStudio/**",
       // Windows junction-point symlinks that deny scandir (EPERM)
       "**/Application Data/**",
       "**/Local Settings/**",
