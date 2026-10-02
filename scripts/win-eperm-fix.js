@@ -26,7 +26,7 @@ if (process.platform === 'win32') {
     if (typeof callback === 'function') {
       const wrappedCallback = function (err, link) {
         if (err && (err.code === 'EPERM' || err.code === 'EACCES')) {
-          return callback(null, ''); // Return empty string
+          return callback(null, '');
         }
         return callback(err, link);
       };
@@ -36,7 +36,6 @@ if (process.platform === 'win32') {
     return origReadlink.call(fs, p, ...args);
   };
 
-  // Patch fs.promises.readlink
   if (fs.promises && fs.promises.readlink) {
     const origReadlinkPromise = fs.promises.readlink;
     fs.promises.readlink = async function patchedReadlinkPromise(p, ...args) {
@@ -51,14 +50,13 @@ if (process.platform === 'win32') {
     };
   }
 
-  // Patch async readdir (callback-style, used by glob)
   const origReaddir = fs.readdir;
   fs.readdir = function patchedReaddir(p, ...args) {
     const callback = args[args.length - 1];
     if (typeof callback === 'function') {
       const wrappedCallback = function (err, files) {
         if (err && (err.code === 'EPERM' || err.code === 'EACCES')) {
-          return callback(null, []); // Return empty listing
+          return callback(null, []);
         }
         return callback(err, files);
       };
@@ -68,7 +66,6 @@ if (process.platform === 'win32') {
     return origReaddir.call(fs, p, ...args);
   };
 
-  // Patch promise-based readdir (used by newer code)
   if (fs.promises) {
     const origReaddirPromise = fs.promises.readdir;
     fs.promises.readdir = async function patchedReaddirPromise(p, ...args) {
@@ -83,7 +80,6 @@ if (process.platform === 'win32') {
     };
   }
 
-  // Patch sync readdir (used by glob.sync)
   const origReaddirSync = fs.readdirSync;
   fs.readdirSync = function patchedReaddirSync(p, ...args) {
     try {
@@ -110,7 +106,6 @@ if (process.platform === 'win32') {
     return false;
   };
 
-  // Patch fs.readFile (callback-style)
   const origReadFile = fs.readFile;
   fs.readFile = function patchedReadFile(p, ...args) {
     const callback = args[args.length - 1];
@@ -128,7 +123,6 @@ if (process.platform === 'win32') {
     return origReadFile.call(fs, p, ...args);
   };
 
-  // Patch fs.readFileSync
   const origReadFileSync = fs.readFileSync;
   fs.readFileSync = function patchedReadFileSync(p, ...args) {
     let data = origReadFileSync.call(fs, p, ...args);
@@ -139,7 +133,6 @@ if (process.platform === 'win32') {
     return data;
   };
 
-  // Patch fs.promises.readFile
   if (fs.promises) {
     const origReadFilePromise = fs.promises.readFile;
     fs.promises.readFile = async function patchedReadFilePromise(p, ...args) {

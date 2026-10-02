@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { dedupe } from "@/store/pageDataStore";
 import { Badge, Button } from "@/shared/components";
 import { getModelsByProviderId } from "@/shared/constants/models";
 import { isAnthropicCompatibleProvider, isOpenAICompatibleProvider } from "@/shared/constants/providers";
@@ -218,9 +219,12 @@ export default function BasicChatPageClient() {
       setLoadError("");
 
       try {
-        const providersRes = await fetch("/api/providers", { cache: "no-store" });
-        const providersData = await providersRes.json().catch(() => ({}));
-        const connections = Array.isArray(providersData.connections)
+        // Shared with the providers/usage pages: the connection list is the same
+        // payload, so a single fetch serves every page open in this load.
+        const providersData = await dedupe("providers:connections", () =>
+          fetch("/api/providers", { cache: "no-store" }).then((r) => r.json().catch(() => ({})))
+        );
+        const connections = Array.isArray(providersData?.connections)
           ? providersData.connections.filter((connection) => connection?.isActive !== false)
           : [];
 
@@ -891,7 +895,7 @@ export default function BasicChatPageClient() {
                         <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3 mt-2">
                           {message.attachments.map((attachment) => (
                             <a key={attachment.id} href={attachment.dataUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-[18px] border border-white/10 bg-black/20">
-                              <img src={attachment.dataUrl} alt={attachment.name} className="h-28 w-full object-cover" />
+                              <img src={attachment.dataUrl} alt={attachment.name} className="h-28 w-full object-cover" loading="lazy" decoding="async" />
                             </a>
                           ))}
                         </div>

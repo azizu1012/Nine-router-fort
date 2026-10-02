@@ -1,15 +1,15 @@
 import { FORMATS } from "./formats.js";
 import { ensureToolCallIds, fixMissingToolResponses } from "./concerns/toolCall.js";
-import { prepareClaudeRequest } from "./formats/claude.js";
-import { cloakClaudeTools } from "../utils/claudeCloaking.js";
+import { prepareClaudeRequest, ensureTrailingUserTurn } from "./formats/claude.js";
+import { cloakClaudeTools, decloakStreamChunk } from "../utils/claudeCloaking.js";
+import { restoreToolNames } from "../utils/opencodeFingerprint.js";
 import { filterToOpenAIFormat } from "./formats/openai.js";
 import { normalizeThinkingConfig } from "../services/provider.js";
 import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
 import { captureSessionId } from "../utils/sessionManager.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
-import { StreamingTextNormalizer } from "../utils/formatNormalizer.js";
-import { XMLThinkingExtractor } from "../utils/thinkingExtractor.js";
+import { ROLE, GEMINI_ROLE } from "./schema/roles.js";
 
 // Registry for translators. Lazy-init guards against circular-import order:
 // translator modules call register() (side-effect) before this module's body runs.
@@ -50,10 +50,26 @@ function stripContentTypes(body, stripList = []) {
   }
 }
 
+// Role the client's conversation actually ended on, in the source format's own
+// shape — not every source uses messages[] (Gemini/Antigravity: contents[],
+// Responses/Codex: input[]). Only an explicit trailing model/assistant turn is
+// real prefill and must reach ensureTrailingUserTurn as ROLE.ASSISTANT; every
+// other tail (including no role, e.g. a function output) stays undefined so
+// the emptied-turn fix still applies.
+function detectClientLastRole(body) {
+  if (Array.isArray(body?.messages)) return body.messages[body.messages.length - 1]?.role;
+  const items = Array.isArray(body?.contents) ? body.contents : Array.isArray(body?.input) ? body.input : null;
+  if (!items) return undefined;
+  const role = items[items.length - 1]?.role;
+  return role === ROLE.ASSISTANT || role === GEMINI_ROLE.MODEL ? ROLE.ASSISTANT : undefined;
+}
+
 // Translate request: source -> openai -> target
 export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
   ensureInitialized();
   let result = body;
+  // Role the client actually ended on, before any translator drops an emptied turn.
+  const clientLastRole = detectClientLastRole(body);
 
   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
   stripContentTypes(result, stripList);
@@ -64,8 +80,13 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // Always ensure tool_calls have id (some providers require it)
   ensureToolCallIds(result);
   
-  // Fix missing tool responses (insert empty tool_result if needed)
-  fixMissingToolResponses(result);
+  // Kiro performs stricter source-aware reconciliation after session replay.
+  // The generic helper inserts OpenAI `role: tool` messages, which a direct
+  // Claude→Kiro translator cannot consume and which cannot repair partial
+  // parallel tool results.
+  if (targetFormat !== FORMATS.KIRO) {
+    fixMissingToolResponses(result);
+  }
 
   // Capture thinking intent from the original (pre-translation) body, before any
   // format conversion strips/renames the fields. Applied after translation.
@@ -105,8 +126,16 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     }
   }
 
-  // Normalize thinking to the target provider-native format (config-driven, capability-aware)
-  applyThinking(targetFormat, model, result, provider, thinkingIntent);
+  // Normalize thinking to the target provider-native format (config-driven, capability-aware).
+  // Kiro's GenerateAssistantResponse request does not accept the generic top-level
+  // `thinking` field; its translators map thinking intent to KAS-compatible
+  // systemPrompt/additionalModelRequestFields instead.
+  const kiroThinkingMappedByTranslator =
+    targetFormat === FORMATS.KIRO &&
+    (sourceFormat === FORMATS.OPENAI || sourceFormat === FORMATS.CLAUDE);
+  if (!kiroThinkingMappedByTranslator) {
+    applyThinking(targetFormat, model, result, provider, thinkingIntent);
+  }
 
   // Always normalize to clean OpenAI format when target is OpenAI
   // This handles hybrid requests (e.g., OpenAI messages + Claude tools)
@@ -120,9 +149,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   if (targetFormat === FORMATS.CLAUDE) {
     const apiKey = credentials?.accessToken || credentials?.apiKey || null;
     result = prepareClaudeRequest(result, provider, apiKey, connectionId, credentials?.rawHeaders, clientSessionId);
+    if (Array.isArray(result?.messages)) result.messages = ensureTrailingUserTurn(result.messages, clientLastRole);
   }
 
-  // Claude cloaking: rename client tools with _cc suffix (anti-ban)
+  // Claude cloaking: rename client tools with CLAUDE_TOOL_SUFFIX (anti-ban)
   // quirk: only providers flagged cloakToolsOnOAuth, and only with an OAuth token
   if (PROVIDERS[provider]?.quirks?.cloakToolsOnOAuth) {
     const apiKey = credentials?.accessToken || credentials?.apiKey || null;
@@ -147,46 +177,15 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   return result;
 }
 
-function processOpenAIChunk(chunk, textNormalizer, thinkingExtractor) {
-  if (!chunk || !chunk.choices?.[0]) return chunk;
-  const choice = chunk.choices[0];
-  const delta = choice.delta;
-  if (!delta) return chunk;
-
-  // Extract thinking and format LaTeX / arrows from content
-  if (delta.content && typeof delta.content === "string") {
-    const events = thinkingExtractor.feed(delta.content);
-    let newContent = "";
-    let newThinking = "";
-
-    for (const event of events) {
-      if (event.type === "text") {
-        newContent += textNormalizer.feed(event.content);
-      } else if (event.type === "thinking") {
-        newThinking += event.content;
-      }
-    }
-
-    if (newContent) {
-      delta.content = newContent;
-    } else {
-      delete delta.content;
-    }
-
-    if (newThinking) {
-      delta.reasoning_content = (delta.reasoning_content || "") + newThinking;
-    }
-  }
-
-  return chunk;
-}
-
 // Translate response chunk: target -> openai -> source
 export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   ensureInitialized();
-  // If same format, return as-is
+  // If same format, return as-is — except the tool name may still be cloaked:
+  // translateRequest() suffixes client tools for OAuth-cloaked Claude providers
+  // even when no format conversion is needed, so streamed tool_use blocks must
+  // be decloaked here or the client sees an unknown ("_ide"-suffixed) tool.
   if (sourceFormat === targetFormat) {
-    return [chunk];
+    return [restoreToolNames(decloakStreamChunk(chunk, state?.toolNameMap), state?.toolNameMap)];
   }
 
   let results = [chunk];
@@ -199,7 +198,8 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   const directFn = responseRegistry.get(`${targetFormat}:${sourceFormat}`);
   if (directFn) {
     const converted = directFn(chunk, state);
-    return converted ? (Array.isArray(converted) ? converted : [converted]) : [];
+    const directResults = converted ? (Array.isArray(converted) ? converted : [converted]) : [];
+    return restoreToolNames(directResults, state?.toolNameMap);
   }
 
   // Step 1: target -> openai (if target is not openai)
@@ -212,59 +212,6 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
         results = Array.isArray(converted) ? converted : [converted];
         openaiResults = results; // Store OpenAI intermediate
       }
-    }
-  }
-
-  // Initialize normalizers on state for translate mode
-  if (state) {
-    state.textNormalizer ??= new StreamingTextNormalizer();
-    state.thinkingExtractor ??= new XMLThinkingExtractor();
-  }
-
-  // Apply LaTeX/arrow normalization and thinking extraction on the intermediate OpenAI chunks
-  if (state && results.length > 0) {
-    const processedResults = [];
-    for (const item of results) {
-      if (item && item.choices?.[0]?.delta) {
-        const processed = processOpenAIChunk(item, state.textNormalizer, state.thinkingExtractor);
-        if (processed) processedResults.push(processed);
-      } else {
-        processedResults.push(item);
-      }
-    }
-    results = processedResults;
-  }
-
-  // Flush remaining buffers at the end of the stream
-  if (state && chunk === null) {
-    const flushedEvents = state.thinkingExtractor.flush();
-    let newContent = "";
-    let newThinking = "";
-    for (const event of flushedEvents) {
-      if (event.type === "text") {
-        newContent += state.textNormalizer.flush();
-      } else if (event.type === "thinking") {
-        newThinking += event.content;
-      }
-    }
-    
-    if (newContent || newThinking) {
-      const flushChunk = {
-        id: state.messageId || `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: state.model || "model",
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: null
-        }]
-      };
-      if (newContent) flushChunk.choices[0].delta.content = newContent;
-      if (newThinking) flushChunk.choices[0].delta.reasoning_content = newThinking;
-      
-      // Insert this flushed chunk at the beginning of results (before the null chunk)
-      results = [flushChunk, ...results];
     }
   }
 
@@ -282,6 +229,8 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
       results = finalResults;
     }
   }
+
+  results = restoreToolNames(results, state?.toolNameMap);
 
   // Attach OpenAI intermediate results for logging
   if (openaiResults && sourceFormat !== FORMATS.OPENAI && targetFormat !== FORMATS.OPENAI) {
@@ -334,8 +283,15 @@ export function initState(sourceFormat) {
       funcArgsBuf: {},
       funcNames: {},
       funcCallIds: {},
+      funcItemAdded: {},
       funcArgsDone: {},
       funcItemDone: {},
+      customToolNames: new Set(),
+      // Chat Completions usage for response.completed. Not state.usage: other translators in
+      // the same pipeline overwrite that in their own shapes.
+      responsesUsage: null,
+      // finish_reason arrived before usage; response.completed waits for the usage chunk.
+      completionPending: false,
       completedSent: false
     };
   }

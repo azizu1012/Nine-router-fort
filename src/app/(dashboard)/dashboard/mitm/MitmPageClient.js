@@ -5,6 +5,7 @@ import { MITM_TOOLS } from "@/shared/constants/cliTools";
 import { getModelsByProviderId } from "@/shared/constants/models";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { MitmServerCard, MitmToolCard } from "@/app/(dashboard)/dashboard/cli-tools/components";
+import { dedupe } from "@/store/pageDataStore";
 
 export default function MitmPageClient() {
   const [connections, setConnections] = useState([]);
@@ -15,51 +16,25 @@ export default function MitmPageClient() {
   const [mitmStatus, setMitmStatus] = useState({ running: false, certExists: false, dnsStatus: {}, hasCachedPassword: false });
 
   useEffect(() => {
-    fetchConnections();
-    fetchApiKeys();
-    fetchAliases();
-    fetchCloudSettings();
+    let cancelled = false;
+    // These were four sequential awaits, so the page painted in four serial
+    // round-trips. Fan them out and share each query with any other page that
+    // needs the same payload in this load.
+    (async () => {
+      const [connData, keysData, aliasData, settingsData] = await Promise.all([
+        dedupe("providers:connections", () => fetch("/api/providers").then((r) => (r.ok ? r.json() : null))),
+        dedupe("api-keys", () => fetch("/api/keys").then((r) => (r.ok ? r.json() : null))),
+        dedupe("model-aliases", () => fetch("/api/models/alias").then((r) => (r.ok ? r.json() : null))),
+        dedupe("settings", () => fetch("/api/settings").then((r) => (r.ok ? r.json() : null))),
+      ]);
+      if (cancelled) return;
+      if (connData) setConnections(connData.connections || []);
+      if (keysData) setApiKeys(keysData.keys || []);
+      if (aliasData) setModelAliases(aliasData.aliases || {});
+      if (settingsData) setCloudEnabled(settingsData.cloudEnabled || false);
+    })();
+    return () => { cancelled = true; };
   }, []);
-
-  const fetchConnections = async () => {
-    try {
-      const res = await fetch("/api/providers");
-      if (res.ok) {
-        const data = await res.json();
-        setConnections(data.connections || []);
-      }
-    } catch { /* ignore */ }
-  };
-
-  const fetchApiKeys = async () => {
-    try {
-      const res = await fetch("/api/keys");
-      if (res.ok) {
-        const data = await res.json();
-        setApiKeys(data.keys || []);
-      }
-    } catch { /* ignore */ }
-  };
-
-  const fetchAliases = async () => {
-    try {
-      const res = await fetch("/api/models/alias");
-      if (res.ok) {
-        const data = await res.json();
-        setModelAliases(data.aliases || {});
-      }
-    } catch { /* ignore */ }
-  };
-
-  const fetchCloudSettings = async () => {
-    try {
-      const res = await fetch("/api/settings");
-      if (res.ok) {
-        const data = await res.json();
-        setCloudEnabled(data.cloudEnabled || false);
-      }
-    } catch { /* ignore */ }
-  };
 
   const getActiveProviders = () => connections.filter(c => c.isActive !== false);
 

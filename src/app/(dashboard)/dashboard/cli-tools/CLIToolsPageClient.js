@@ -5,19 +5,28 @@ import { CardSkeleton } from "@/shared/components";
 import { CLI_TOOLS, MITM_TOOLS } from "@/shared/constants/cliTools";
 import { MitmLinkCard } from "./components";
 import ToolSummaryCard from "./components/ToolSummaryCard";
+import { read, setCached, STATUS_TTL_MS } from "@/store/pageDataStore";
 
 const ALL_STATUSES_URL = "/api/cli-tools/all-statuses";
+const CACHE_KEY = "cli-tools-status";
 
 export default function CLIToolsPageClient({ machineId }) {
-  const [loading, setLoading] = useState(true);
-  const [toolStatuses, setToolStatuses] = useState({});
+  // Probing every tool's config file is the expensive part of this page, and the
+  // answer only changes when a tool is installed/configured, so cache it for the
+  // full TTL. The background refetch below still runs on every mount.
+  const [loading, setLoading] = useState(() => read(CACHE_KEY, STATUS_TTL_MS) === null);
+  const [toolStatuses, setToolStatuses] = useState(() => read(CACHE_KEY, STATUS_TTL_MS) || {});
 
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         const res = await fetch(ALL_STATUSES_URL);
-        if (res.ok && mounted) setToolStatuses(await res.json());
+        if (res.ok && mounted) {
+          const data = await res.json();
+          setCached(CACHE_KEY, data);
+          setToolStatuses(data);
+        }
       } catch (error) {
         console.log("Error fetching tool statuses:", error);
       } finally {

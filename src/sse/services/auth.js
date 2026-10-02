@@ -1,13 +1,31 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getApiKeyByKey } from "@/lib/localDb";
-import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools, getApiKeyByKey, getComboByName } from "@/lib/localDb";
+import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
+import { errorResponse } from "open-sse/utils/error.js";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
-import { errorResponse } from "open-sse/utils/error.js";
-import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+import { resolveProviderId, FREE_PROVIDERS, getProviderAlias } from "@/shared/constants/providers.js";
+import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
+import {
+  incrementActiveRequest,
+  decrementActiveRequest,
+  getActiveRequestCount,
+  getMinuteTokenUsage,
+  getDailyRequestCount,
+  resetKeyLimits,
+} from "@/shared/utils/keyLimiter.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+
+const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
+
+function githubMonthlyResetMs(status, errorText, provider) {
+  if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
+  if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
+  const now = new Date();
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+}
 
 /**
  * Get provider credentials from localDb
@@ -22,6 +40,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const requestedModel = options?.requestedModel || model;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -37,7 +56,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     if (FREE_PROVIDERS[providerId]?.noAuth) {
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
-      const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: override.proxyPoolId || "" });
+      const strategy = override.rotateStrategy || "none";
+      let pickedId = override.proxyPoolId || null;
+      if (strategy !== "none") {
+        const allPools = await getProxyPools({ isActive: true });
+        const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
+        pickedId = pickProxyPoolId(poolIds, strategy, providerId);
+      }
+      const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
       return {
         id: "noauth",
         connectionName: "Public",
@@ -61,10 +87,25 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return null;
     }
 
-    // Filter out model-locked and excluded connections
+    // Antigravity quota cache is lazy: only populated after that account returns 409/429.
+    const isAntigravity = providerId === "antigravity";
+    const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
+
+    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      const enabled = c.providerSpecificData?.enabledModels;
+      if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
+      // Antigravity: skip if live quota exhausted for this model
+      if (isAntigravity && model && antigravityQuotaCache) {
+        const quota = antigravityQuotaCache.get(c.id)?.[model];
+        if (quota && quota.remainingPercentage <= 0 && quota.resetAt && new Date(quota.resetAt).getTime() > Date.now()) {
+          const account = c.id?.slice(0, 8) || "unknown";
+          log.info("AG_QUOTA", `${account} | CACHE_BLOCK ${model} — skip upstream until ${quota.resetAt}`);
+          return false;
+        }
+      }
       return true;
     });
 
@@ -79,9 +120,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
-      // Find earliest lock expiry across all connections for retry timing
+      // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
+      if (isAntigravity && model && antigravityQuotaCache) {
+        connections.forEach((c) => {
+          const resetAt = antigravityQuotaCache.get(c.id)?.[model]?.resetAt;
+          if (resetAt && new Date(resetAt).getTime() > Date.now()) expiries.push(resetAt);
+        });
+      }
       const earliest = expiries.sort()[0] || null;
       if (earliest) {
         const earliestConn = lockedConns[0];
@@ -207,19 +254,29 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
 
+  // GitHub premium-request exhaustion is account-wide until the next UTC month.
+  const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
+
   // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
   let shouldFallback, cooldownMs, newBackoffLevel;
-  if (resetsAtMs && resetsAtMs > Date.now()) {
+  if (githubResetAtMs) {
     shouldFallback = true;
-    cooldownMs = Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+    cooldownMs = githubResetAtMs - Date.now();
+    newBackoffLevel = 0;
+  } else if (resetsAtMs && resetsAtMs > Date.now()) {
+    shouldFallback = true;
+    // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
+    cooldownMs = resolveProviderId(provider) === "antigravity"
+      ? resetsAtMs - Date.now()
+      : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel, resolveProviderId(provider)));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
-  const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(model, cooldownMs);
+  const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
+  const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -279,7 +336,13 @@ export async function clearAccountError(connectionId, currentConnection, model =
 
   // Only reset error state if no active locks remain
   if (remainingActiveLocks.length === 0) {
-    Object.assign(clearObj, { testStatus: "active", lastError: null, lastErrorAt: null, backoffLevel: 0 });
+    Object.assign(clearObj, {
+      testStatus: "active",
+      lastError: null,
+      errorCode: null,
+      lastErrorAt: null,
+      backoffLevel: 0
+    });
   }
 
   await updateProviderConnection(connectionId, clearObj);
@@ -312,464 +375,283 @@ export async function isValidApiKey(apiKey) {
   return await validateApiKey(apiKey);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-API-key permission + limit layer
+//
+// Every inbound /v1 request is gated here: provider allow-list, concurrency
+// ceiling, rolling TPM and rolling RPD. Counters live in keyLimiter.js and real
+// token usage is fed in by usageRepo.saveRequestUsage(), so every modality is
+// accounted exactly once.
+// ═══════════════════════════════════════════════════════════════════════════
+const KEY_RECORD_TTL_MS = 15 * 1000;
+
+// key -> { record, ts }. Shared across Next.js module instances.
+if (!global.__apiKeyRecordCache) global.__apiKeyRecordCache = new Map();
+
+async function getCachedKeyRecord(apiKey) {
+  const cache = global.__apiKeyRecordCache;
+  const hit = cache.get(apiKey);
+  if (hit && Date.now() - hit.ts < KEY_RECORD_TTL_MS) return hit.record;
+  const record = await getApiKeyByKey(apiKey);
+  // Negative results are cached too: an unknown key is a common flood pattern
+  // and must not turn into one DB read per request.
+  cache.set(apiKey, { record, ts: Date.now() });
+  if (cache.size > 2000) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  return record;
+}
+
 /**
- * Verify API Key permissions, including provider restrictions and rate/concurrency limits.
+ * Drop cached key records and limit counters.
+ * Call after any write to the apiKeys table or to provider connections.
+ * @param {string|null} apiKey - one key, or null to clear everything
  */
-export async function verifyApiKeyPermissions(apiKey, provider, modelStr) {
+export function invalidateApiKeyCache(apiKey = null) {
+  if (apiKey) {
+    global.__apiKeyRecordCache.delete(apiKey);
+    resetKeyLimits(apiKey);
+  } else {
+    global.__apiKeyRecordCache.clear();
+  }
+}
+
+/**
+ * Every prefix a key is allowed to address, derived from its allow-list.
+ *
+ * `allowedProviders` holds operator-chosen tokens which may be a built-in
+ * provider id, a registry alias, a custom node id, a custom prefix, or a
+ * connection id. For a custom provider, `connections[].provider` holds the NODE
+ * id while models are published under the node's alias — so a node id in the
+ * allow-list has to expand to the prefix its models actually use.
+ *
+ * CRITICAL: this must not become "every identifier that exists". Expanding to all
+ * routable aliases would grant access to every provider the operator happens to
+ * have connected, which defeats the allow-list entirely. A prefix is reachable
+ * only when the operator listed it, or listed a connection that publishes it.
+ */
+async function getAllowedPrefixes(allowedSet) {
+  const prefixes = new Set(allowedSet);
+  if (allowedSet.size === 0) return prefixes;
+  let connections;
+  try {
+    connections = await getProviderConnections({});
+  } catch (err) {
+    // Fail-open on a DB hiccup: a transient error must not lock everyone out.
+    log.warn("AUTH", `allow-list expansion unavailable, restrictions skipped: ${err?.message}`);
+    return null;
+  }
+  for (const c of connections) {
+    if (!c) continue;
+    const ids = connectionIdentifiers(c);
+    // Selected by the operator (directly, or via one of its ids) -> every prefix
+    // this connection publishes becomes reachable.
+    if (ids.some((v) => allowedSet.has(v))) {
+      for (const v of ids) prefixes.add(v);
+    }
+  }
+  return prefixes;
+}
+
+/** All the names one connection can be addressed by. */
+function connectionIdentifiers(conn) {
+  const out = [];
+  const push = (v) => {
+    if (!v) return;
+    const s = String(v).trim().toLowerCase();
+    if (s && !out.includes(s)) out.push(s);
+  };
+  push(conn.provider);
+  push(conn.id);
+  push(conn?.providerSpecificData?.prefix);
+  if (conn.provider) push(getProviderAlias(conn.provider));
+  return out;
+}
+
+/** True when `modelStr` is a bare combo whose seats include an allowed prefix. */
+async function isComboAllowed(modelStr, allowedPrefixes) {
+  let combo = null;
+  try {
+    combo = await getComboByName(modelStr);
+  } catch {
+    return false;
+  }
+  if (!combo) return false;
+  const byName = new Map([[combo.name, combo]]);
+  return (combo.models || []).some((seat) => isModelRefAllowed(seat, allowedPrefixes, byName));
+}
+
+/**
+ * Verify API key permissions: provider allow-list + concurrency/TPM/RPD limits.
+ * @returns {{ valid: boolean, status?: number, error?: string, retryAfter?: number }}
+ */
+export async function verifyApiKeyPermissions(apiKey, modelStr) {
   if (!apiKey) return { valid: true };
 
-  const keyRecord = await getApiKeyByKey(apiKey);
-  if (!keyRecord) {
-    return { valid: false, status: 401, error: "Invalid API key" };
-  }
-  if (!keyRecord.isActive) {
-    return { valid: false, status: 403, error: "API key is paused" };
-  }
+  const keyRecord = await getCachedKeyRecord(apiKey);
+  if (!keyRecord) return { valid: true };
+  if (!keyRecord.isActive) return { valid: false, status: 403, error: "API key is paused" };
 
-  // 1. Check provider restrictions (only when provider is known)
-  // allowedProviders may contain either:
-  //   - built-in provider names (e.g. "openai", "anthropic")
-  //   - provider node IDs (e.g. "openai-compatible-chat-a327e1f7-...")
-  // providerConnections.provider stores the node ID for custom providers.
-  if (provider && keyRecord.allowedProviders && keyRecord.allowedProviders.length > 0) {
-    const normalizedProvider = provider.toLowerCase();
-    const allowedSet = new Set(keyRecord.allowedProviders.map(p => p.toLowerCase()));
-
-    // Check 1: simple built-in name match (e.g. "openai" in ["openai"])
-    let isAllowed = allowedSet.has(normalizedProvider);
-
-    // Check 2: built-in provider connections (provider field = provider name)
-    if (!isAllowed) {
-      try {
-        const connections = await getProviderConnections({ provider });
-        isAllowed = connections.some(
-          c => allowedSet.has(c.id?.toLowerCase()) || allowedSet.has(c.provider?.toLowerCase())
-        );
-      } catch (_) {
-        isAllowed = true;
+  const allowed = Array.isArray(keyRecord.allowedProviders) ? keyRecord.allowedProviders : [];
+  if (allowed.length > 0) {
+    const allowedSet = new Set(allowed.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
+    const prefixes = await getAllowedPrefixes(allowedSet);
+    // null = the DB read failed and we deliberately fail open this cycle.
+    if (prefixes) {
+      const prefix = String(modelStr || "").split("/")[0];
+      const ok = prefix
+        ? prefixes.has(prefix.trim().toLowerCase())
+        : await isComboAllowed(modelStr, prefixes);
+      if (!ok) {
+        return { valid: false, status: 403, error: `API key not authorized for provider: ${prefix || modelStr || "unknown"}` };
       }
     }
+  }
 
-    // Check 3: custom provider nodes — allowedProviders contains node IDs.
-    // Find all connections where their provider field (which stores node ID) is in allowedProviders.
-    // These connections can serve any base provider type (openai-compatible etc.).
-    if (!isAllowed) {
-      try {
-        const allConnections = await getProviderConnections({});
-        isAllowed = allConnections.some(
-          c => allowedSet.has(c.provider?.toLowerCase()) || allowedSet.has(c.id?.toLowerCase())
-        );
-      } catch (_) {
-        isAllowed = true;
-      }
-    }
+  if (keyRecord.limitConcurrency && getActiveRequestCount(apiKey) >= keyRecord.limitConcurrency) {
+    return {
+      valid: false, status: 429, retryAfter: 10,
+      error: `Concurrency limit (${keyRecord.limitConcurrency} workers) exceeded for this API key`,
+    };
+  }
 
-    if (!isAllowed) {
-      return { valid: false, status: 403, error: `API key not authorized for provider: ${provider}` };
+  if (keyRecord.limitTpm) {
+    const minuteUsage = getMinuteTokenUsage(apiKey);
+    if (minuteUsage >= keyRecord.limitTpm) {
+      return {
+        valid: false, status: 429, retryAfter: 60,
+        error: `TPM limit (${keyRecord.limitTpm} tokens/min) exceeded for this API key`,
+      };
     }
   }
 
-  // 2. Check Concurrency Limit (Workers)
-  if (keyRecord.limitConcurrency && keyRecord.limitConcurrency > 0) {
-    const { getActiveRequestCount } = await import("@/shared/utils/keyLimiter");
-    const activeCount = getActiveRequestCount(keyRecord.id);
-    if (activeCount >= keyRecord.limitConcurrency) {
-      return { valid: false, status: 429, error: "Concurrency limit (workers) exceeded for this API key" };
+  if (keyRecord.limitRpd) {
+    const dailyRequests = getDailyRequestCount(apiKey);
+    if (dailyRequests >= keyRecord.limitRpd) {
+      return {
+        valid: false, status: 429, retryAfter: 3600,
+        error: `RPD limit (${keyRecord.limitRpd} requests/day) exceeded for this API key`,
+      };
     }
   }
 
-  // 3. Check TPM (Tokens Per Minute) Limit
-  if (keyRecord.limitTpm && keyRecord.limitTpm > 0) {
-    const { getMinuteTokenUsage } = await import("@/shared/utils/keyLimiter");
-    const usedTokens = getMinuteTokenUsage(keyRecord.id);
-    if (usedTokens >= keyRecord.limitTpm) {
-      return { valid: false, status: 429, error: "TPM (Tokens per Minute) limit exceeded for this API key" };
-    }
-  }
-
-  // 4. Check RPD (Requests Per Day) Limit
-  if (keyRecord.limitRpd && keyRecord.limitRpd > 0) {
-    const { getDailyRequestCount } = await import("@/shared/utils/keyLimiter");
-    const usedRequests = getDailyRequestCount(keyRecord.id);
-    if (usedRequests >= keyRecord.limitRpd) {
-      return { valid: false, status: 429, error: "RPD (Requests per Day) limit exceeded for this API key" };
-    }
-  }
-
-  return { valid: true, keyRecord };
+  return { valid: true };
 }
 
-/**
- * Wrap a Response body stream to trigger a cleanup function when the stream completes/aborts.
- */
+/** Pass a Response through, running `cleanupFn` exactly once on end/cancel/error. */
 export function wrapResponseWithCleanup(response, cleanupFn) {
+  let done = false;
+  const once = () => { if (!done) { done = true; cleanupFn(); } };
   if (!response || !response.body) {
-    cleanupFn();
+    once();
     return response;
   }
-
-  let cleaned = false;
-  const runCleanup = () => {
-    if (!cleaned) {
-      cleaned = true;
-      cleanupFn();
-    }
-  };
-
-  const stream = response.body;
-
-  if (typeof stream.getReader !== "function") {
-    if (typeof stream.on === "function") {
-      stream.on("end", runCleanup);
-      stream.on("close", runCleanup);
-      stream.on("error", runCleanup);
-    } else {
-      runCleanup();
-    }
-    return response;
-  }
-
-  const wrappedStream = new ReadableStream({
-    async start(controller) {
-      const reader = stream.getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            runCleanup();
-            controller.close();
-            break;
-          }
-          controller.enqueue(value);
-        }
-      } catch (err) {
-        runCleanup();
-        controller.error(err);
-      }
+  const reader = response.body.getReader();
+  const cleanupWrapper = new ReadableStream({
+    start(controller) {
+      const push = () => {
+        reader.read().then(({ done: finished, value }) => {
+          if (finished) { once(); try { controller.close(); } catch { /* already closed */ } return; }
+          try { controller.enqueue(value); } catch { once(); return; }
+          push();
+        }).catch((err) => { once(); try { controller.error(err); } catch { /* already closed */ } });
+      };
+      push();
     },
-    cancel(reason) {
-      runCleanup();
-      if (typeof stream.cancel === "function") {
-        stream.cancel(reason);
-      }
-    }
+    cancel() { once(); reader.cancel().catch(() => {}); },
   });
-
-  return new Response(wrappedStream, {
+  return new Response(cleanupWrapper, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers
+    headers: response.headers,
   });
 }
 
 /**
- * Generic wrapper to check API key permissions and enforce TPM/RPD/concurrency limits.
+ * Gate + account one /v1 request. Wraps the real handler so the concurrency
+ * counter is held for the whole stream lifetime, not just the handshake.
  */
 export async function withApiKeyLimits(request, innerHandler, clientRawRequest = null) {
-  let providerVal = null;
+  const apiKey = extractApiKey(request);
+  if (!apiKey) return innerHandler(request, clientRawRequest);
+
   let modelStr = null;
-  let keyRecord = null;
-  let apiKey = null;
-
   try {
-    apiKey = extractApiKey(request);
-  } catch (e) {}
-
-  const settings = await getSettings();
-
-  if (settings.requireApiKey || apiKey) {
-    try {
-      const cloned = request.clone();
-      const contentType = request.headers.get("content-type") || "";
-      if (contentType.includes("multipart/form-data")) {
-        const formData = await cloned.formData();
-        modelStr = formData.get("model");
-      } else {
-        const body = await cloned.json();
-        modelStr = body?.model || null;
-      }
-
-      if (modelStr) {
-        const { getModelInfo } = await import("./model.js");
-        const modelInfo = await getModelInfo(modelStr);
-        providerVal = modelInfo?.provider || null;
-      }
-    } catch (e) {
-      // Ignore if body parsing fails (e.g. GET request, empty request)
-    }
-
-    if (settings.requireApiKey && !apiKey) {
-      log.warn("AUTH", "Missing API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-
-    if (apiKey) {
-      const authResult = await verifyApiKeyPermissions(apiKey, providerVal, modelStr);
-      if (!authResult.valid) {
-        log.warn("AUTH", authResult.error);
-        return errorResponse(authResult.status, authResult.error);
-      }
-      keyRecord = authResult.keyRecord;
-    }
+    modelStr = (await request.clone().json())?.model || null;
+  } catch {
+    // Non-JSON bodies (STT multipart) simply skip the provider allow-list check.
   }
 
-  if (keyRecord) {
-    const { incrementActiveRequest } = await import("@/shared/utils/keyLimiter");
-    incrementActiveRequest(keyRecord.id);
+  const permCheck = await verifyApiKeyPermissions(apiKey, modelStr);
+  if (!permCheck.valid) {
+    log.warn("AUTH", permCheck.error);
+    return errorResponse(
+      permCheck.status || 429,
+      permCheck.error || "API key permission denied",
+      permCheck.retryAfter ? { "Retry-After": String(permCheck.retryAfter) } : null
+    );
   }
 
-  let response;
+  incrementActiveRequest(apiKey);
+  let innerResult;
   try {
-    if (clientRawRequest !== null) {
-      response = await innerHandler(request, clientRawRequest);
-    } else {
-      response = await innerHandler(request);
-    }
+    innerResult = await innerHandler(request, clientRawRequest);
   } catch (err) {
-    if (keyRecord) {
-      const { decrementActiveRequest } = await import("@/shared/utils/keyLimiter");
-      decrementActiveRequest(keyRecord.id);
-    }
+    decrementActiveRequest(apiKey);
     throw err;
   }
 
-  if (keyRecord) {
-    const { decrementActiveRequest } = await import("@/shared/utils/keyLimiter");
-    response = wrapResponseWithCleanup(response, () => {
-      decrementActiveRequest(keyRecord.id);
-    });
+  if (innerResult instanceof Response) {
+    return wrapResponseWithCleanup(innerResult, () => decrementActiveRequest(apiKey));
   }
-
-  return response;
+  decrementActiveRequest(apiKey);
+  return innerResult;
 }
 
 /**
- * Detect if a request is from a Claude Code sub-agent.
- * Ported from router_api/src/logical_HQ_translator/sse_cache_agent.py
+ * The set of model prefixes this request's API key may address, or null when the
+ * key is unrestricted. Callers pass it to isModelRefAllowed().
  */
-export function isSubAgentRequest(body) {
-  if (!body) return false;
-
-  let systemPrompt = "";
-
-  // Anthropic format: body.system (string or array of {text:...})
-  if (body.system) {
-    if (typeof body.system === "string") {
-      systemPrompt = body.system;
-    } else if (Array.isArray(body.system)) {
-      systemPrompt = body.system.map(s => s.text || "").join("\n");
-    }
-  }
-
-  // OpenAI format: body.messages[].role === "system" | "developer"
-  if (!systemPrompt && body.messages) {
-    for (const msg of body.messages) {
-      if (msg.role === "system" || msg.role === "developer") {
-        const content = msg.content;
-        if (typeof content === "string") {
-          systemPrompt = content;
-        } else if (Array.isArray(content)) {
-          systemPrompt = content.filter(c => c.type === "text").map(c => c.text).join("\n");
-        }
-        break;
-      }
-    }
-  }
-
-  if (systemPrompt) {
-    const lower = systemPrompt.toLowerCase();
-
-    if (lower.includes("you are an interactive agent")) return false;
-    if (lower.includes("you are claude code")) return true;
-
-    const subAgentKeywords = [
-      "general-purpose agent", "general-purpose assistant",
-      "explore agent", "file search specialist",
-      "exploration task", "read-only exploration",
-      "claude-code-guide", "statusline-setup",
-      "specialized agent", "subagent", "sub-agent",
-      "security monitor",
-      "you are the claude-code-guide", "you are the explore",
-      "you are the general-purpose", "you are the statusline-setup",
-    ];
-    if (subAgentKeywords.some(kw => lower.includes(kw))) return true;
-    if (/you are (a|an|the)[\s\w\-]*sub\.?agent/i.test(systemPrompt)) return true;
-    if (lower.includes("[sub-agent]")) return true;
-
-    const toolCount = (body.tools || []).length;
-    if (toolCount >= 16 && toolCount <= 25) return true;
-  }
-
-  if (body.messages) {
-    for (const msg of body.messages) {
-      if (msg.role !== "user") continue;
-      const content = msg.content;
-      if (typeof content === "string" && content.trim().startsWith("[SUB-AGENT]")) return true;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block.type === "text" && block.text?.trim().startsWith("[SUB-AGENT]")) return true;
-        }
-      }
-    }
-  }
-
-  return false;
-}
-
-function _anthropicSSE(event, data) {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-function _buildStatusSummary(reason) {
-  const messages = {
-    rate_limit:
-      "⚠️ **[Temporarily Rate Limited]** ⚠️\n\n"
-      + "The system is temporarily rate limited. This is NOT a context error.\n\n"
-      + "**Quick fix:**\n"
-      + "1. Wait 15-30 seconds and retry.\n"
-      + "2. Use `/compact` to reduce context size.",
-    unavailable:
-      "⚠️ **[Service Temporarily Unavailable]** ⚠️\n\n"
-      + "The upstream AI service is temporarily unavailable (503). This is a transient server error.\n\n"
-      + "**Quick fix:**\n"
-      + "1. Wait 30-60 seconds and retry.\n"
-      + "2. The system will automatically retry on the next request.",
-    invalid_key:
-      "⚠️ **[Authentication Error]** ⚠️\n\n"
-      + "Some API keys have billing issues or are invalid. The system has automatically removed them.\n\n"
-      + "**Quick fix:**\n"
-      + "1. Retry now — the system will use a different key.\n"
-      + "2. If the error persists, check your API keys in the dashboard.",
-  };
-  return messages[reason]
-    || "⚠️ **[System Temporarily Overloaded]** ⚠️\n\n"
-    + "All keys/models in the pool are exhausted or rate limited.\n\n"
-    + "**Quick fix:**\n"
-    + "1. Wait 15-30 seconds for rate limits to reset.\n"
-    + "2. Use `/compact` if your context is large (>100K tokens).";
+export async function resolveKeyProviderScope(request) {
+  const apiKey = extractApiKey(request);
+  if (!apiKey) return null;
+  const record = await getCachedKeyRecord(apiKey);
+  const allowed = Array.isArray(record?.allowedProviders) ? record.allowedProviders : [];
+  const allowedSet = new Set(allowed.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
+  if (allowedSet.size === 0) return null;
+  return (await getAllowedPrefixes(allowedSet)) ?? null;
 }
 
 /**
- * Intercept sub-agent error and return a simulated successful HTTP 200 response.
- * Prevents Claude Code from crashing when sub-agents encounter errors.
- * Ported from router_api/src/server/openai_server/auth.py handle_sub_agent_error()
+ * Does this connection serve a provider the allow-list selected? Compares against
+ * the EXPANDED prefix set, so listing a custom node id or a connection id also
+ * admits the alias its models are published under.
  */
-export function handleSubAgentError(body, error, sourceFormat) {
-  const errorMsg = String(error?.message || error || "");
-  let reason = "pool_exhausted";
-  if (/rate|limit|quota|429/i.test(errorMsg)) reason = "rate_limit";
-  else if (/503|unavailable|overloaded|frozen/i.test(errorMsg)) reason = "unavailable";
-  else if (/401|unauthorized|api.?key/i.test(errorMsg)) reason = "invalid_key";
-
-  const modelName = body?.model || "unknown";
-  const isStream = body?.stream !== false;
-  const warningText = _buildStatusSummary(reason);
-
-  // Anthropic format detection
-  const isAnthropic = sourceFormat === "claude" || body?.anthropic_version || body?.system;
-
-  if (isAnthropic) {
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      start(controller) {
-        const msgId = "msg_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-        const totalLen = JSON.stringify(body?.messages || "").length;
-        const inputTokens = Math.max(1, Math.floor(totalLen / 4));
-        const outputTokens = Math.max(1, Math.floor(warningText.length / 4));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("message_start", {
-          type: "message_start",
-          message: {
-            id: msgId, type: "message", role: "assistant", model: modelName,
-            content: [], stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: inputTokens, output_tokens: 0 },
-          }
-        })));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("content_block_start", {
-          type: "content_block_start", index: 0,
-          content_block: { type: "text", text: "" }
-        })));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("content_block_delta", {
-          type: "content_block_delta", index: 0,
-          delta: { type: "text_delta", text: warningText }
-        })));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("content_block_stop", {
-          type: "content_block_stop", index: 0
-        })));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { output_tokens: outputTokens }
-        })));
-
-        controller.enqueue(encoder.encode(_anthropicSSE("message_stop", { type: "message_stop" })));
-        controller.close();
-      }
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "anthropic-version": "2023-06-01",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      }
-    });
-  }
-
-  // OpenAI format
-  const chatId = "chatcmpl-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const created = Math.floor(Date.now() / 1000);
-
-  if (isStream) {
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(encoder.encode("data: " + JSON.stringify({
-          id: chatId, object: "chat.completion.chunk", created, model: modelName,
-          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
-        }) + "\n\n"));
-
-        controller.enqueue(encoder.encode("data: " + JSON.stringify({
-          id: chatId, object: "chat.completion.chunk", created, model: modelName,
-          choices: [{ index: 0, delta: { content: warningText }, finish_reason: null }]
-        }) + "\n\n"));
-
-        controller.enqueue(encoder.encode("data: " + JSON.stringify({
-          id: chatId, object: "chat.completion.chunk", created, model: modelName,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-        }) + "\n\n"));
-
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      }
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      }
-    });
-  }
-
-  const totalLen = JSON.stringify(body?.messages || "").length;
-  return new Response(JSON.stringify({
-    id: chatId, object: "chat.completion", created, model: modelName,
-    choices: [{ index: 0, message: { role: "assistant", content: warningText }, finish_reason: "stop" }],
-    usage: {
-      prompt_tokens: Math.max(1, Math.floor(totalLen / 4)),
-      completion_tokens: Math.max(1, Math.floor(warningText.length / 4)),
-      total_tokens: Math.max(1, Math.floor(totalLen / 4)) + Math.max(1, Math.floor(warningText.length / 4)),
-    }
-  }), {
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-  });
+export function isConnectionAllowed(conn, allowedPrefixes) {
+  if (!allowedPrefixes) return true;
+  if (!conn) return false;
+  return connectionIdentifiers(conn).some((v) => allowedPrefixes.has(v));
 }
 
+/**
+ * Is this `prefix/model` ref (or bare combo name) usable under the scope?
+ * Combos count as allowed when at least one seat is, mirroring the chat gate.
+ * @param {Map<string, object>} [combosByName] - for resolving nested combos
+ */
+export function isModelRefAllowed(ref, allowedPrefixes, combosByName = new Map(), depth = 0) {
+  if (!allowedPrefixes) return true;
+  if (depth > 5) return false;
+  const text = String(ref || "").trim();
+  if (!text) return false;
+  const slash = text.indexOf("/");
+  if (slash > 0) return allowedPrefixes.has(text.slice(0, slash).trim().toLowerCase());
+  const combo = combosByName.get(text);
+  if (!combo) return allowedPrefixes.has(text.toLowerCase());
+  return (combo.models || []).some((seat) => isModelRefAllowed(seat, allowedPrefixes, combosByName, depth + 1));
+}
+
+// Sub-agent degradation is engine-side (open-sse) because chatCore.js is the
+// caller and the engine must not import from @/. Re-exported here so app code
+// keeps a single auth entry point.
+export { isSubAgentRequest, handleSubAgentError } from "open-sse/utils/subAgentFallback.js";

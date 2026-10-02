@@ -30,13 +30,20 @@ export async function PUT(request, { params }) {
 
     const updateData = {};
     if (isActive !== undefined) updateData.isActive = isActive;
-    if (name !== undefined) updateData.name = name;
-    if (allowedProviders !== undefined) updateData.allowedProviders = allowedProviders;
-    if (limitTpm !== undefined) updateData.limitTpm = limitTpm ? parseInt(limitTpm, 10) : null;
-    if (limitRpd !== undefined) updateData.limitRpd = limitRpd ? parseInt(limitRpd, 10) : null;
-    if (limitConcurrency !== undefined) updateData.limitConcurrency = limitConcurrency ? parseInt(limitConcurrency, 10) : null;
+    if (typeof name === "string" && name.trim()) updateData.name = name.trim();
+    if (allowedProviders !== undefined) {
+      updateData.allowedProviders = Array.isArray(allowedProviders) ? allowedProviders : null;
+    }
+    for (const [field, value] of [["limitTpm", limitTpm], ["limitRpd", limitRpd], ["limitConcurrency", limitConcurrency]]) {
+      if (value !== undefined) updateData[field] = value;
+    }
 
     const updated = await updateApiKey(id, updateData);
+    // A changed pause/allow-list/limit must take effect on the next request.
+    const { invalidateApiKeyCache } = await import("@/sse/services/auth.js");
+    const { getApiKeyById } = await import("@/lib/localDb");
+    invalidateApiKeyCache((await getApiKeyById(id))?.key || null);
+    invalidateApiKeyCache();
 
     return NextResponse.json({ key: updated });
   } catch (error) {
@@ -54,6 +61,11 @@ export async function DELETE(request, { params }) {
     if (!deleted) {
       return NextResponse.json({ error: "Key not found" }, { status: 404 });
     }
+
+    // Drop the deleted key's counters so its concurrency slot is freed at once.
+    const { invalidateApiKeyCache } = await import("@/sse/services/auth.js");
+    if (existing.key) invalidateApiKeyCache(existing.key);
+    invalidateApiKeyCache();
 
     return NextResponse.json({ message: "Key deleted successfully" });
   } catch (error) {

@@ -177,26 +177,21 @@ function buildGeminiNativeUrl(requestUrl, model, action) {
   return upstreamUrl.toString();
 }
 
-async function validateGeminiNativeClientKey(request, model) {
+async function validateGeminiNativeClientKey(request) {
   const settings = await getSettings();
+  if (!settings.requireApiKey) return null;
+
   const apiKey = extractGeminiClientApiKey(request);
-
-  if (settings.requireApiKey || apiKey) {
-    if (settings.requireApiKey && !apiKey) {
-      return { error: Response.json({ error: { message: "Missing API key" } }, { status: 401 }) };
-    }
-
-    if (apiKey) {
-      const { verifyApiKeyPermissions } = await import("@/sse/services/auth");
-      const authResult = await verifyApiKeyPermissions(apiKey, "gemini", model);
-      if (!authResult.valid) {
-        return { error: Response.json({ error: { message: authResult.error } }, { status: authResult.status }) };
-      }
-      return { keyRecord: authResult.keyRecord };
-    }
+  if (!apiKey) {
+    return Response.json({ error: { message: "Missing API key" } }, { status: 401 });
   }
 
-  return { keyRecord: null };
+  const valid = await isValidApiKey(apiKey);
+  if (!valid) {
+    return Response.json({ error: { message: "Invalid API key" } }, { status: 401 });
+  }
+
+  return null;
 }
 
 function buildGeminiNativeAuthHeaders(credentials) {
@@ -241,37 +236,8 @@ function getSafeGeminiNativeErrorText(error) {
 }
 
 async function forwardGeminiNativeRequest(request, body, model, action) {
-  const validation = await validateGeminiNativeClientKey(request, model);
-  if (validation.error) return validation.error;
-
-  const { keyRecord } = validation;
-  if (keyRecord) {
-    const { incrementActiveRequest } = await import("@/shared/utils/keyLimiter");
-    incrementActiveRequest(keyRecord.id);
-  }
-
-  let response;
-  try {
-    response = await forwardGeminiNativeRequestInner(request, body, model, action);
-  } catch (err) {
-    if (keyRecord) {
-      const { decrementActiveRequest } = await import("@/shared/utils/keyLimiter");
-      decrementActiveRequest(keyRecord.id);
-    }
-    throw err;
-  }
-
-  if (keyRecord) {
-    const { wrapResponseWithCleanup, decrementActiveRequest } = await import("@/sse/services/auth");
-    response = wrapResponseWithCleanup(response, () => {
-      decrementActiveRequest(keyRecord.id);
-    });
-  }
-
-  return response;
-}
-
-async function forwardGeminiNativeRequestInner(request, body, model, action) {
+  const authError = await validateGeminiNativeClientKey(request);
+  if (authError) return authError;
 
   const modelId = normalizeGeminiNativeModel(model);
   if (!GEMINI_NATIVE_MODEL_PATTERN.test(modelId)) {

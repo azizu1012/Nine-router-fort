@@ -15,7 +15,12 @@ export async function GET() {
 
     let files;
     try {
-      files = await readdir(cachePath);
+      // turbopackIgnore: this is a runtime-only path in the user's home dir.
+      // Without the annotation the file tracer cannot resolve the dynamic
+      // readdir, decides "the whole project was traced", and sweeps unrelated
+      // directories (including DATA_DIR, which holds every provider token)
+      // into the standalone bundle.
+      files = await readdir(/* turbopackIgnore: true */ cachePath);
     } catch (error) {
       return NextResponse.json({
         found: false,

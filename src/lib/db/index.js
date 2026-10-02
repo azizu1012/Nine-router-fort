@@ -64,7 +64,7 @@ export {
 
 // Request details
 export {
-  saveRequestDetail, getRequestDetails, getRequestDetailById,
+  saveRequestDetail, getRequestDetails, getRequestDetailById, getDistinctProviders,
 } from "./repos/requestDetailsRepo.js";
 
 // Export/import full DB
@@ -78,16 +78,9 @@ export async function exportDb() {
     providerNodes: db.all(`SELECT * FROM providerNodes`).map((r) => ({ ...parseJson(r.data, {}), id: r.id, type: r.type, name: r.name, createdAt: r.createdAt, updatedAt: r.updatedAt })),
     proxyPools: db.all(`SELECT * FROM proxyPools`).map((r) => ({ ...parseJson(r.data, {}), id: r.id, isActive: r.isActive === 1, testStatus: r.testStatus, createdAt: r.createdAt, updatedAt: r.updatedAt })),
     apiKeys: db.all(`SELECT * FROM apiKeys`).map((r) => ({
-      id: r.id,
-      key: r.key,
-      name: r.name,
-      machineId: r.machineId,
-      isActive: r.isActive === 1,
-      createdAt: r.createdAt,
+      id: r.id, key: r.key, name: r.name, machineId: r.machineId, isActive: r.isActive === 1, createdAt: r.createdAt,
       allowedProviders: r.allowedProviders ? parseJson(r.allowedProviders) : null,
-      limitTpm: r.limitTpm,
-      limitRpd: r.limitRpd,
-      limitConcurrency: r.limitConcurrency
+      limitTpm: r.limitTpm || null, limitRpd: r.limitRpd || null, limitConcurrency: r.limitConcurrency || null,
     })),
     combos: db.all(`SELECT * FROM combos`).map((r) => ({ id: r.id, name: r.name, kind: r.kind, models: parseJson(r.models, []), createdAt: r.createdAt, updatedAt: r.updatedAt })),
     modelAliases: {},
@@ -149,18 +142,9 @@ export async function importDb(payload) {
     for (const k of payload.apiKeys || []) {
       db.run(
         `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt, allowedProviders, limitTpm, limitRpd, limitConcurrency) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          k.id,
-          k.key,
-          k.name || null,
-          k.machineId || null,
-          k.isActive === false ? 0 : 1,
-          k.createdAt || new Date().toISOString(),
-          k.allowedProviders ? JSON.stringify(k.allowedProviders) : null,
-          k.limitTpm || null,
-          k.limitRpd || null,
-          k.limitConcurrency || null
-        ]
+        [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, k.createdAt || new Date().toISOString(),
+          Array.isArray(k.allowedProviders) && k.allowedProviders.length ? JSON.stringify(k.allowedProviders) : null,
+          k.limitTpm || null, k.limitRpd || null, k.limitConcurrency || null]
       );
     }
     for (const c of payload.combos || []) {

@@ -13,10 +13,15 @@ import {
   CLIENT_PING_FAST_MS,
 } from "./endpointConstants";
 import { clientPingUrl, clientPingAny } from "./endpointPing";
+import useSettingsStore from "@/store/settingsStore";
+import { dedupe, invalidate } from "@/store/pageDataStore";
 import EndpointRow from "./components/EndpointRow";
 import StatusAlert from "./components/StatusAlert";
 import Tooltip from "./components/Tooltip";
 import SecurityWarning from "./components/SecurityWarning";
+
+// Common providers offered in the allow-list even before they are connected, so
+// a key can be pre-scoped before the first connection exists.
 const STANDARD_PROVIDERS = [
   { id: "openai", name: "OpenAI" },
   { id: "anthropic", name: "Anthropic" },
@@ -31,65 +36,120 @@ const STANDARD_PROVIDERS = [
   { id: "bedrock", name: "AWS Bedrock" },
 ];
 
+const EMPTY_LIMITS = { customPrefix: "", allowedProviders: [], customProviders: "", limitTpm: "", limitRpd: "", limitConcurrency: "" };
+
+/**
+ * Provider allow-list picker. Rows come from live connections plus a set of
+ * well-known ids so a key can be scoped before the provider is connected.
+ * The free-text field covers custom node ids that are not in `options` yet.
+ */
+function ProviderScopeFields({ options, selected, customValue, onToggle, onCustomChange }) {
+  return (
+    <div className="border-t border-border pt-3">
+      <p className="text-sm font-medium text-text-main mb-2">Allowed Providers</p>
+      <div className="grid grid-cols-2 gap-2.5 mb-3 max-h-[160px] overflow-y-auto custom-scrollbar p-0.5">
+        {options.map((prov) => (
+          <label key={prov.id} className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={selected.includes(prov.id)}
+              onChange={() => onToggle(prov.id)}
+              className="rounded border-border text-primary focus:ring-primary/20"
+            />
+            <div className="flex items-center gap-1.5 min-w-0">
+              {prov.isActive ? (
+                <span className="relative flex h-2 w-2 shrink-0" title="Active connection">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+                </span>
+              ) : prov.isNotConfigured ? (
+                <span className="h-2 w-2 rounded-full bg-black/15 dark:bg-white/15 shrink-0" title="Not configured" />
+              ) : (
+                <span className="h-2 w-2 rounded-full bg-amber-400 dark:bg-amber-500 shrink-0" title="Paused / offline" />
+              )}
+              <span className="truncate text-xs font-medium" title={`${prov.name} (${prov.id})`}>
+                {prov.name}
+              </span>
+            </div>
+          </label>
+        ))}
+      </div>
+      <Input
+        label="Custom Providers (comma separated)"
+        value={customValue}
+        onChange={(e) => onCustomChange(e.target.value)}
+        placeholder="e.g. my-openai-node, other-provider"
+      />
+      <p className="text-xs text-text-muted mt-1">
+        Leave everything empty to let this key use every configured provider. A request outside the
+        selected scope is rejected with 403.
+      </p>
+    </div>
+  );
+}
+
+function LimitFields({ limits, onChange }) {
+  return (
+    <div className="border-t border-border pt-3 flex flex-col gap-3">
+      <p className="text-sm font-medium text-text-main">Rate &amp; Concurrency Limits</p>
+      <Input
+        label="Concurrency Limit (Max Workers)"
+        type="number"
+        min="0"
+        value={limits.limitConcurrency}
+        onChange={(e) => onChange({ limitConcurrency: e.target.value })}
+        placeholder="Unlimited"
+      />
+      <Input
+        label="Tokens Per Minute (TPM) Limit"
+        type="number"
+        min="0"
+        value={limits.limitTpm}
+        onChange={(e) => onChange({ limitTpm: e.target.value })}
+        placeholder="Unlimited"
+      />
+      <Input
+        label="Requests Per Day (RPD) Limit"
+        type="number"
+        min="0"
+        value={limits.limitRpd}
+        onChange={(e) => onChange({ limitRpd: e.target.value })}
+        placeholder="Unlimited"
+      />
+      <p className="text-xs text-text-muted">
+        Counters are per key and in-memory: they reset when the server restarts. Exceeding a limit
+        returns 429 with a Retry-After header.
+      </p>
+    </div>
+  );
+}
+
+function splitAllowed(allowed, standardIds) {
+  const list = Array.isArray(allowed) ? allowed : [];
+  return {
+    standard: list.filter((p) => standardIds.includes(p)),
+    custom: list.filter((p) => !standardIds.includes(p)),
+  };
+}
+
 export default function APIPageClient({ machineId }) {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [dbConnections, setDbConnections] = useState([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
-  // Key creation state
-  const [customPrefix, setCustomPrefix] = useState("");
-  const [allowedProviders, setAllowedProviders] = useState([]);
-  const [customProvidersInput, setCustomProvidersInput] = useState("");
-  const [limitTpm, setLimitTpm] = useState("");
-  const [limitRpd, setLimitRpd] = useState("");
-  const [limitConcurrency, setLimitConcurrency] = useState("");
+  // ── Per-key scoping + limits (create) ──
+  const [newKeyLimits, setNewKeyLimits] = useState(EMPTY_LIMITS);
 
-  // Edit Key Modal state
+  // ── Per-key scoping + limits (edit) ──
   const [editingKey, setEditingKey] = useState(null);
   const [editKeyName, setEditKeyName] = useState("");
-  const [editAllowedProviders, setEditAllowedProviders] = useState([]);
-  const [editCustomProvidersInput, setEditCustomProvidersInput] = useState("");
-  const [editLimitTpm, setEditLimitTpm] = useState("");
-  const [editLimitRpd, setEditLimitRpd] = useState("");
-  const [editLimitConcurrency, setEditLimitConcurrency] = useState("");
+  const [editLimits, setEditLimits] = useState(EMPTY_LIMITS);
 
-  const uniqueProvidersList = useMemo(() => {
-    const list = [];
-    const seen = new Set();
-    // 1. Add configured connections from database
-    for (const conn of dbConnections) {
-      if (!seen.has(conn.provider)) {
-        seen.add(conn.provider);
-        list.push({
-          id: conn.provider,
-          name: conn.name || conn.provider,
-          isActive: conn.isActive === true || conn.isActive === 1
-        });
-      } else {
-        const existing = list.find(p => p.id === conn.provider);
-        if (existing && (conn.isActive === true || conn.isActive === 1)) {
-          existing.isActive = true;
-        }
-      }
-    }
-    // 2. Add standard ones that are NOT already in the list
-    for (const std of STANDARD_PROVIDERS) {
-      if (!seen.has(std.id)) {
-        seen.add(std.id);
-        list.push({
-          id: std.id,
-          name: std.name,
-          isActive: false,
-          isNotConfigured: true
-        });
-      }
-    }
-    return list;
-  }, [dbConnections]);
+  // Connections power the allow-list picker (a custom node id is a valid entry).
+  const [dbConnections, setDbConnections] = useState([]);
 
   const [requireApiKey, setRequireApiKey] = useState(false);
   const [requireLogin, setRequireLogin] = useState(true);
@@ -151,6 +211,46 @@ export default function APIPageClient({ machineId }) {
   }, []);
 
   const { copied, copy } = useCopyToClipboard();
+
+  // Every id the allow-list picker can offer: one row per distinct provider,
+  // flagged by whether any of its connections is currently active. Custom
+  // provider nodes are keyed by node id, which is what the API matches on.
+  const providerOptions = useMemo(() => {
+    const byProvider = new Map();
+    for (const conn of dbConnections) {
+      if (!conn?.provider) continue;
+      const id = conn.provider;
+      const active = conn.isActive === true || conn.isActive === 1;
+      const existing = byProvider.get(id);
+      if (existing) {
+        existing.isActive = existing.isActive || active;
+      } else {
+        byProvider.set(id, {
+          id,
+          name: conn.name || conn.email || id,
+          isActive: active,
+          isCustom: true,
+        });
+      }
+    }
+    const options = [...byProvider.values()];
+    const known = new Set(options.map((o) => o.id));
+    for (const std of STANDARD_PROVIDERS) {
+      if (!known.has(std.id)) options.push({ ...std, isActive: false, isNotConfigured: true });
+    }
+    return options;
+  }, [dbConnections]);
+
+  const standardProviderIds = useMemo(() => new Set(STANDARD_PROVIDERS.map((p) => p.id)), []);
+
+  // Allowed providers = checked standard rows + the free-text custom list.
+  const composeAllowed = (checked, customText) => {
+    const custom = String(customText || "")
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
+    return [...checked, ...custom];
+  };
 
   // Security gate: block remote exposure while dashboard uses default password or login is off.
   const isLoginUnsafe = !requireLogin || !hasPassword;
@@ -260,16 +360,15 @@ export default function APIPageClient({ machineId }) {
   const loadSettings = async () => {
     setTunnelChecking(true);
     try {
-      const [settingsRes, statusRes] = await Promise.all([
-        fetch("/api/settings"),
+      const [settingsData, statusRes] = await Promise.all([
+        useSettingsStore.getState().fetchSettings(),
         fetch("/api/tunnel/status", { cache: "no-store" })
       ]);
-      if (settingsRes.ok) {
-        const data = await settingsRes.json();
-        setRequireApiKey(data.requireApiKey || false);
-        setRequireLogin(data.requireLogin !== false);
-        setHasPassword(data.hasPassword || false);
-        setTunnelDashboardAccess(data.tunnelDashboardAccess || false);
+      if (settingsData) {
+        setRequireApiKey(settingsData.requireApiKey || false);
+        setRequireLogin(settingsData.requireLogin !== false);
+        setHasPassword(settingsData.hasPassword || false);
+        setTunnelDashboardAccess(settingsData.tunnelDashboardAccess || false);
       }
       if (statusRes.ok) {
         const data = await statusRes.json();
@@ -295,12 +394,8 @@ export default function APIPageClient({ machineId }) {
 
   const handleTunnelDashboardAccess = async (value) => {
     try {
-      const res = await fetch("/api/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tunnelDashboardAccess: value }),
-      });
-      if (res.ok) setTunnelDashboardAccess(value);
+      const updated = await useSettingsStore.getState().patchSettings({ tunnelDashboardAccess: value });
+      if (updated) setTunnelDashboardAccess(value);
     } catch (error) {
       console.log("Error updating tunnelDashboardAccess:", error);
     }
@@ -308,12 +403,8 @@ export default function APIPageClient({ machineId }) {
 
   const handleRequireApiKey = async (value) => {
     try {
-      const res = await fetch("/api/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requireApiKey: value }),
-      });
-      if (res.ok) setRequireApiKey(value);
+      const updated = await useSettingsStore.getState().patchSettings({ requireApiKey: value });
+      if (updated) setRequireApiKey(value);
     } catch (error) {
       console.log("Error updating requireApiKey:", error);
     }
@@ -321,17 +412,34 @@ export default function APIPageClient({ machineId }) {
 
   const fetchData = async () => {
     try {
-      const keysRes = await fetch("/api/keys");
-      const keysData = await keysRes.json();
-      if (keysRes.ok) {
-        setKeys(keysData.keys || []);
-      }
+      const fetchKeys = async () => {
+        const res = await fetch("/api/keys");
+        if (!res.ok) return [];
+        const data = await res.json();
+        return data.keys || [];
+      };
 
-      const connRes = await fetch("/api/providers");
-      const connData = await connRes.json();
-      if (connRes.ok) {
-        setDbConnections(connData.connections || []);
+      // Keys and connections are needed together to render the allow-list picker;
+      // fetch them in parallel and share the connection payload with the other pages.
+      const [initialKeys, connData] = await Promise.all([
+        fetchKeys(),
+        dedupe("providers:connections", () => fetch("/api/providers").then((r) => (r.ok ? r.json() : null))),
+      ]);
+      if (connData) setDbConnections(connData.connections || []);
+
+      let existing = initialKeys;
+      // Auto-provision a default key for first-time users so the endpoint works out of the box.
+      if (existing.length === 0) {
+        try {
+          const createRes = await fetch("/api/keys", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: "Default Key" }),
+          });
+          if (createRes.ok) existing = await fetchKeys();
+        } catch { /* fall through to empty render */ }
       }
+      setKeys(existing);
     } catch (error) {
       console.log("Error fetching data:", error);
     } finally {
@@ -682,36 +790,28 @@ export default function APIPageClient({ machineId }) {
   const handleCreateKey = async () => {
     if (!newKeyName.trim()) return;
 
-    const customList = customProvidersInput
-      ? customProvidersInput.split(",").map(p => p.trim()).filter(Boolean)
-      : [];
-    const finalAllowed = [...allowedProviders, ...customList];
-
+    const allowed = composeAllowed(newKeyLimits.allowedProviders, newKeyLimits.customProviders);
     try {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: newKeyName,
-          customPrefix: customPrefix.trim() || undefined,
-          allowedProviders: finalAllowed.length > 0 ? finalAllowed : undefined,
-          limitTpm: limitTpm ? parseInt(limitTpm, 10) : undefined,
-          limitRpd: limitRpd ? parseInt(limitRpd, 10) : undefined,
-          limitConcurrency: limitConcurrency ? parseInt(limitConcurrency, 10) : undefined,
+          customPrefix: newKeyLimits.customPrefix.trim() || undefined,
+          allowedProviders: allowed.length > 0 ? allowed : undefined,
+          limitTpm: newKeyLimits.limitTpm || undefined,
+          limitRpd: newKeyLimits.limitRpd || undefined,
+          limitConcurrency: newKeyLimits.limitConcurrency || undefined,
         }),
       });
       const data = await res.json();
 
       if (res.ok) {
         setCreatedKey(data.key);
+        invalidate("api-keys");
         await fetchData();
         setNewKeyName("");
-        setCustomPrefix("");
-        setAllowedProviders([]);
-        setCustomProvidersInput("");
-        setLimitTpm("");
-        setLimitRpd("");
-        setLimitConcurrency("");
+        setNewKeyLimits(EMPTY_LIMITS);
         setShowAddModal(false);
       }
     } catch (error) {
@@ -720,41 +820,36 @@ export default function APIPageClient({ machineId }) {
   };
 
   const handleOpenEditModal = (key) => {
+    const { standard, custom } = splitAllowed(key.allowedProviders, [...standardProviderIds]);
     setEditingKey(key);
     setEditKeyName(key.name || "");
-    const rawAllowed = key.allowedProviders || [];
-    const standardIds = STANDARD_PROVIDERS.map(p => p.id);
-    const standardMatches = rawAllowed.filter(p => standardIds.includes(p));
-    const customMatches = rawAllowed.filter(p => !standardIds.includes(p));
-    setEditAllowedProviders(standardMatches);
-    setEditCustomProvidersInput(customMatches.join(", "));
-    setEditLimitTpm(key.limitTpm || "");
-    setEditLimitRpd(key.limitRpd || "");
-    setEditLimitConcurrency(key.limitConcurrency || "");
+    setEditLimits({
+      customPrefix: "",
+      allowedProviders: standard,
+      customProviders: custom.join(", "),
+      limitTpm: key.limitTpm || "",
+      limitRpd: key.limitRpd || "",
+      limitConcurrency: key.limitConcurrency || "",
+    });
   };
 
   const handleUpdateKey = async () => {
-    if (!editingKey) return;
-
-    const customList = editCustomProvidersInput
-      ? editCustomProvidersInput.split(",").map(p => p.trim()).filter(Boolean)
-      : [];
-    const finalAllowed = [...editAllowedProviders, ...customList];
-
+    if (!editingKey || !editKeyName.trim()) return;
+    const allowed = composeAllowed(editLimits.allowedProviders, editLimits.customProviders);
     try {
       const res = await fetch(`/api/keys/${editingKey.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: editKeyName.trim(),
-          allowedProviders: finalAllowed.length > 0 ? finalAllowed : null,
-          limitTpm: editLimitTpm ? parseInt(editLimitTpm, 10) : null,
-          limitRpd: editLimitRpd ? parseInt(editLimitRpd, 10) : null,
-          limitConcurrency: editLimitConcurrency ? parseInt(editLimitConcurrency, 10) : null,
+          allowedProviders: allowed.length > 0 ? allowed : null,
+          limitTpm: editLimits.limitTpm || null,
+          limitRpd: editLimits.limitRpd || null,
+          limitConcurrency: editLimits.limitConcurrency || null,
         }),
       });
-
       if (res.ok) {
+        invalidate("api-keys");
         await fetchData();
         setEditingKey(null);
       }
@@ -1139,7 +1234,7 @@ export default function APIPageClient({ machineId }) {
                     </code>
                     <button
                       onClick={() => toggleKeyVisibility(key.id)}
-                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
+                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-all"
                       title={visibleKeys.has(key.id) ? "Hide key" : "Show key"}
                     >
                       <span className="material-symbols-outlined text-[14px]">
@@ -1148,7 +1243,7 @@ export default function APIPageClient({ machineId }) {
                     </button>
                     <button
                       onClick={() => copy(key.key, key.id)}
-                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
+                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-all"
                     >
                       <span className="material-symbols-outlined text-[14px]">
                         {copied === key.id ? "check" : "content_copy"}
@@ -1158,14 +1253,20 @@ export default function APIPageClient({ machineId }) {
                   <p className="text-xs text-text-muted mt-1">
                     Created {new Date(key.createdAt).toLocaleDateString()}
                   </p>
-                  {/* Badges for allowed providers & limits */}
+                  {/* Scope + limit summary so the effective policy is visible without opening the editor */}
                   <div className="flex flex-wrap gap-1 mt-2">
                     {key.allowedProviders && key.allowedProviders.length > 0 ? (
-                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-500 border border-blue-500/20" title="Allowed Providers">
+                      <span
+                        className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-500 border border-blue-500/20"
+                        title={`Restricted to: ${key.allowedProviders.join(", ")}`}
+                      >
                         Providers: {key.allowedProviders.join(", ")}
                       </span>
                     ) : (
-                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-500 border border-green-500/20" title="Allowed Providers">
+                      <span
+                        className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-500 border border-green-500/20"
+                        title="This key can route to every configured provider"
+                      >
                         Providers: All
                       </span>
                     )}
@@ -1212,7 +1313,7 @@ export default function APIPageClient({ machineId }) {
                   <button
                     onClick={() => handleOpenEditModal(key)}
                     className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
-                    title="Edit key limits/permissions"
+                    title="Edit key name, provider scope and limits"
                   >
                     <span className="material-symbols-outlined text-[18px]">edit</span>
                   </button>
@@ -1236,11 +1337,7 @@ export default function APIPageClient({ machineId }) {
         onClose={() => {
           setShowAddModal(false);
           setNewKeyName("");
-          setCustomPrefix("");
-          setAllowedProviders([]);
-          setLimitTpm("");
-          setLimitRpd("");
-          setLimitConcurrency("");
+          setNewKeyLimits(EMPTY_LIMITS);
         }}
       >
         <div className="flex flex-col gap-4 max-h-[70vh] overflow-y-auto px-1 py-2">
@@ -1252,85 +1349,29 @@ export default function APIPageClient({ machineId }) {
           />
           <Input
             label="Key Identifier Prefix (Optional)"
-            value={customPrefix}
-            onChange={(e) => setCustomPrefix(e.target.value)}
-            placeholder="username (e.g., trung)"
-            description="If set, key identifier format will be 'trung_xxxx' (plus CRC). If empty, generates a random 6-char identifier."
+            value={newKeyLimits.customPrefix}
+            onChange={(e) => setNewKeyLimits((p) => ({ ...p, customPrefix: e.target.value }))}
+            placeholder="e.g. trung"
+            description="Sets the readable key id (prefix_xxxx). Leave empty for a random 6-char id. Letters, digits and underscore only."
           />
-
-          <div className="border-t border-border pt-3">
-            <p className="text-sm font-medium text-text-main mb-2">Allowed Providers</p>
-            <div className="grid grid-cols-2 gap-2.5 mb-3 max-h-[160px] overflow-y-auto custom-scrollbar p-0.5">
-              {uniqueProvidersList.map((prov) => (
-                <label key={prov.id} className="flex items-center gap-2 text-sm cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={allowedProviders.includes(prov.id)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setAllowedProviders([...allowedProviders, prov.id]);
-                      } else {
-                        setAllowedProviders(allowedProviders.filter((p) => p !== prov.id));
-                      }
-                    }}
-                    className="rounded border-border text-primary focus:ring-primary/20"
-                  />
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    {prov.isActive ? (
-                      <span className="relative flex h-2 w-2 shrink-0" title="Active & Available">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                      </span>
-                    ) : prov.isNotConfigured ? (
-                      <span className="h-2 w-2 rounded-full bg-black/15 dark:bg-white/15 shrink-0" title="Not Configured"></span>
-                    ) : (
-                      <span className="h-2 w-2 rounded-full bg-amber-400 dark:bg-amber-500 shrink-0" title="Paused/Offline"></span>
-                    )}
-                    <span className="truncate text-xs font-medium" title={`${prov.name} (${prov.id})`}>
-                      {prov.name}
-                    </span>
-                  </div>
-                </label>
-              ))}
-            </div>
-            <Input
-              label="Custom Providers (comma separated)"
-              value={customProvidersInput}
-              onChange={(e) => setCustomProvidersInput(e.target.value)}
-              placeholder="e.g., custom-openai, my-provider"
-              className="mt-2"
-            />
-            <p className="text-xs text-text-muted mt-1">If none selected/entered, the key will have access to all providers.</p>
-          </div>
-
-          <div className="border-t border-border pt-3 flex flex-col gap-3">
-            <p className="text-sm font-medium text-text-main">Rate & Concurrency Limits</p>
-            <Input
-              label="Concurrency Limit (Max Workers)"
-              type="number"
-              value={limitConcurrency}
-              onChange={(e) => setLimitConcurrency(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-            <Input
-              label="Tokens Per Minute (TPM) Limit"
-              type="number"
-              value={limitTpm}
-              onChange={(e) => setLimitTpm(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-            <Input
-              label="Requests Per Day (RPD) Limit"
-              type="number"
-              value={limitRpd}
-              onChange={(e) => setLimitRpd(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-          </div>
-
+          <ProviderScopeFields
+            options={providerOptions}
+            selected={newKeyLimits.allowedProviders}
+            customValue={newKeyLimits.customProviders}
+            onToggle={(id) =>
+              setNewKeyLimits((p) => ({
+                ...p,
+                allowedProviders: p.allowedProviders.includes(id)
+                  ? p.allowedProviders.filter((x) => x !== id)
+                  : [...p.allowedProviders, id],
+              }))
+            }
+            onCustomChange={(value) => setNewKeyLimits((p) => ({ ...p, customProviders: value }))}
+          />
+          <LimitFields
+            limits={newKeyLimits}
+            onChange={(patch) => setNewKeyLimits((p) => ({ ...p, ...patch }))}
+          />
           <div className="flex gap-2 border-t border-border pt-4 mt-2">
             <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
               Create
@@ -1339,15 +1380,53 @@ export default function APIPageClient({ machineId }) {
               onClick={() => {
                 setShowAddModal(false);
                 setNewKeyName("");
-                setCustomPrefix("");
-                setAllowedProviders([]);
-                setLimitTpm("");
-                setLimitRpd("");
-                setLimitConcurrency("");
+                setNewKeyLimits(EMPTY_LIMITS);
               }}
               variant="ghost"
               fullWidth
             >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Edit Key Modal — name, provider scope and rate/concurrency limits */}
+      <Modal
+        isOpen={!!editingKey}
+        title="Edit API Key Scope & Limits"
+        onClose={() => setEditingKey(null)}
+      >
+        <div className="flex flex-col gap-4 max-h-[70vh] overflow-y-auto px-1 py-2">
+          <Input
+            label="Key Name"
+            value={editKeyName}
+            onChange={(e) => setEditKeyName(e.target.value)}
+            placeholder="Key Name"
+          />
+          <ProviderScopeFields
+            options={providerOptions}
+            selected={editLimits.allowedProviders}
+            customValue={editLimits.customProviders}
+            onToggle={(id) =>
+              setEditLimits((p) => ({
+                ...p,
+                allowedProviders: p.allowedProviders.includes(id)
+                  ? p.allowedProviders.filter((x) => x !== id)
+                  : [...p.allowedProviders, id],
+              }))
+            }
+            onCustomChange={(value) => setEditLimits((p) => ({ ...p, customProviders: value }))}
+          />
+          <LimitFields
+            limits={editLimits}
+            onChange={(patch) => setEditLimits((p) => ({ ...p, ...patch }))}
+          />
+          <div className="flex gap-2 border-t border-border pt-4 mt-2">
+            <Button onClick={handleUpdateKey} fullWidth disabled={!editKeyName.trim()}>
+              Save Changes
+            </Button>
+            <Button onClick={() => setEditingKey(null)} variant="ghost" fullWidth>
               Cancel
             </Button>
           </div>
@@ -1386,108 +1465,6 @@ export default function APIPageClient({ machineId }) {
           <Button onClick={() => setCreatedKey(null)} fullWidth>
             Done
           </Button>
-        </div>
-      </Modal>
-
-      {/* Edit Key Modal */}
-      <Modal
-        isOpen={!!editingKey}
-        title="Edit API Key Limits & Permissions"
-        onClose={() => setEditingKey(null)}
-      >
-        <div className="flex flex-col gap-4 max-h-[70vh] overflow-y-auto px-1 py-2">
-          <Input
-            label="Key Name"
-            value={editKeyName}
-            onChange={(e) => setEditKeyName(e.target.value)}
-            placeholder="Key Name"
-          />
-
-          <div className="border-t border-border pt-3">
-            <p className="text-sm font-medium text-text-main mb-2">Allowed Providers</p>
-            <div className="grid grid-cols-2 gap-2.5 mb-3 max-h-[160px] overflow-y-auto custom-scrollbar p-0.5">
-              {uniqueProvidersList.map((prov) => (
-                <label key={prov.id} className="flex items-center gap-2 text-sm cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={editAllowedProviders.includes(prov.id)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setEditAllowedProviders([...editAllowedProviders, prov.id]);
-                      } else {
-                        setEditAllowedProviders(editAllowedProviders.filter((p) => p !== prov.id));
-                      }
-                    }}
-                    className="rounded border-border text-primary focus:ring-primary/20"
-                  />
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    {prov.isActive ? (
-                      <span className="relative flex h-2 w-2 shrink-0" title="Active & Available">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                      </span>
-                    ) : prov.isNotConfigured ? (
-                      <span className="h-2 w-2 rounded-full bg-black/15 dark:bg-white/15 shrink-0" title="Not Configured"></span>
-                    ) : (
-                      <span className="h-2 w-2 rounded-full bg-amber-400 dark:bg-amber-500 shrink-0" title="Paused/Offline"></span>
-                    )}
-                    <span className="truncate text-xs font-medium" title={`${prov.name} (${prov.id})`}>
-                      {prov.name}
-                    </span>
-                  </div>
-                </label>
-              ))}
-            </div>
-            <Input
-              label="Custom Providers (comma separated)"
-              value={editCustomProvidersInput}
-              onChange={(e) => setEditCustomProvidersInput(e.target.value)}
-              placeholder="e.g., custom-openai, my-provider"
-              className="mt-2"
-            />
-            <p className="text-xs text-text-muted mt-1">If none selected/entered, the key will have access to all providers.</p>
-          </div>
-
-          <div className="border-t border-border pt-3 flex flex-col gap-3">
-            <p className="text-sm font-medium text-text-main">Rate & Concurrency Limits</p>
-            <Input
-              label="Concurrency Limit (Max Workers)"
-              type="number"
-              value={editLimitConcurrency}
-              onChange={(e) => setEditLimitConcurrency(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-            <Input
-              label="Tokens Per Minute (TPM) Limit"
-              type="number"
-              value={editLimitTpm}
-              onChange={(e) => setEditLimitTpm(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-            <Input
-              label="Requests Per Day (RPD) Limit"
-              type="number"
-              value={editLimitRpd}
-              onChange={(e) => setEditLimitRpd(e.target.value)}
-              placeholder="Unlimited"
-              min="0"
-            />
-          </div>
-
-          <div className="flex gap-2 border-t border-border pt-4 mt-2">
-            <Button onClick={handleUpdateKey} fullWidth disabled={!editKeyName.trim()}>
-              Save Changes
-            </Button>
-            <Button
-              onClick={() => setEditingKey(null)}
-              variant="ghost"
-              fullWidth
-            >
-              Cancel
-            </Button>
-          </div>
         </div>
       </Modal>
 

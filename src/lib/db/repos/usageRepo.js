@@ -2,16 +2,21 @@ import { EventEmitter } from "events";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { getMeta, setMeta } from "../helpers/metaStore.js";
+import { addTokenUsage } from "@/shared/utils/keyLimiter.js";
 
 function maskApiKey(key) {
   if (!key || typeof key !== "string") return null;
-  if (key.length <= 8) return key.charAt(0) + "***";
-  return key.slice(0, 8) + "***";
+  if (key.length <= 12) return key.charAt(0) + "***";
+  // Keep the tail: keys sharing a machine-id prefix (team keys) must not collide.
+  return key.slice(0, 8) + "***" + key.slice(-4);
 }
 
 const PENDING_TIMEOUT_MS = 60 * 1000;
 const RING_CAP = 50;
 const CONN_CACHE_TTL_MS = 30 * 1000;
+// Usage dashboards re-render on every request tick; these aggregations scan a lot
+// of rows, so memoise them briefly. saveRequestUsage() invalidates on write.
+const STATS_CACHE_TTL_MS = 30 * 1000;
 const PERIOD_MS = { "24h": 86400000, "7d": 604800000, "30d": 2592000000, "60d": 5184000000 };
 
 // In-memory state shared across Next.js modules
@@ -25,6 +30,8 @@ if (!global._pendingTimers) global._pendingTimers = {};
 if (!global._recentRing) global._recentRing = { items: [], initialized: false };
 if (!global._connectionMapCache) global._connectionMapCache = { map: {}, ts: 0 };
 if (!global._statsEmitTimers) global._statsEmitTimers = { pending: null, update: null };
+if (!global._statsCache) global._statsCache = {};
+if (!global._chartCache) global._chartCache = {};
 
 const pendingRequests = global._pendingRequests;
 const lastErrorProvider = global._lastErrorProvider;
@@ -32,6 +39,15 @@ const pendingTimers = global._pendingTimers;
 const recentRing = global._recentRing;
 const connCache = global._connectionMapCache;
 const statsEmitTimers = global._statsEmitTimers;
+const statsCache = global._statsCache;
+const chartCache = global._chartCache;
+
+/** Drop the memoised aggregations so the next dashboard read is fresh. */
+export function invalidateUsageCaches() {
+  for (const key of Object.keys(statsCache)) delete statsCache[key];
+  for (const key of Object.keys(chartCache)) delete chartCache[key];
+  connCache.ts = 0;
+}
 
 export const statsEmitter = global._statsEmitter;
 
@@ -189,8 +205,7 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
     lastErrorProvider.ts = Date.now();
   }
 
-  const t = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  console.log(`[${t}] [PENDING] ${started ? "START" : "END"}${error ? " (ERROR)" : ""} | provider=${provider} | model=${model}`);
+  // [PENDING] console line removed; lifecycle is visible via "▶" and "📊 done" lines
   scheduleStatsEvent("pending");
 }
 
@@ -250,6 +265,11 @@ export async function saveRequestUsage(entry) {
     const promptTokens = tokens.prompt_tokens || tokens.input_tokens || 0;
     const completionTokens = tokens.completion_tokens || tokens.output_tokens || 0;
 
+    // Feed the per-API-key TPM meter with the real token counts. Done before the
+    // transaction so it counts exactly the requests that reach storage, and it is
+    // the single point every modality reports through.
+    if (entry.apiKey) addTokenUsage(entry.apiKey, promptTokens + completionTokens);
+
     let inserted = false;
 
     // All 3 writes (history insert, daily upsert, lifetime counter) in ONE transaction.
@@ -307,21 +327,8 @@ export async function saveRequestUsage(entry) {
 
     if (inserted) {
       pushToRing(entry);
+      invalidateUsageCaches();
       scheduleStatsEvent("update", 250);
-
-      if (entry.apiKey) {
-        try {
-          const { parseApiKey } = await import("@/shared/utils/apiKey");
-          const parsed = parseApiKey(entry.apiKey);
-          if (parsed && parsed.keyId) {
-            const { addTokenUsage } = await import("@/shared/utils/keyLimiter");
-            const totalTokens = promptTokens + completionTokens;
-            addTokenUsage(parsed.keyId, totalTokens);
-          }
-        } catch (err) {
-          console.error("Failed to track key token usage:", err);
-        }
-      }
     }
   } catch (e) {
     console.error("Failed to save usage stats:", e);
@@ -350,15 +357,18 @@ export async function getUsageHistory(filter = {}) {
 
 function loadDaysInRange(adapter, maxDays) {
   if (maxDays == null) {
-    return adapter.all(`SELECT dateKey, data FROM usageDaily`);
+    return adapter.all(`SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC`);
   }
   const today = new Date();
   const cutoff = new Date(today.getFullYear(), today.getMonth(), today.getDate() - maxDays + 1);
   const cutoffKey = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, "0")}-${String(cutoff.getDate()).padStart(2, "0")}`;
-  return adapter.all(`SELECT dateKey, data FROM usageDaily WHERE dateKey >= ?`, [cutoffKey]);
+  return adapter.all(`SELECT dateKey, data FROM usageDaily WHERE dateKey >= ? ORDER BY dateKey ASC`, [cutoffKey]);
 }
 
 export async function getUsageStats(period = "all") {
+  const cached = statsCache[period];
+  if (cached && Date.now() - cached.ts < STATS_CACHE_TTL_MS) return cached.data;
+
   const db = await getAdapter();
 
   const [{ getProviderConnections }, { getApiKeys }, { getProviderNodes }] = await Promise.all([
@@ -552,8 +562,15 @@ export async function getUsageStats(period = "all") {
       }
     }
 
-    // Overlay precise lastUsed timestamps from history
-    const overlayCutoff = maxDays ? Date.now() - maxDays * 86400000 : 0;
+    // Overlay precise lastUsed timestamps from history.
+    // ponytail: overlay scans only a recent window; entries older than that keep
+    // day-level lastUsed from usageDaily. Upgrade to a materialized per-key
+    // MAX(timestamp) table if exact old timestamps ever matter.
+    const OVERLAY_WINDOW_MS = 2 * 86400000;
+    const overlayCutoff = Math.max(
+      maxDays ? Date.now() - maxDays * 86400000 : 0,
+      Date.now() - OVERLAY_WINDOW_MS
+    );
     const histRows = db.all(
       `SELECT timestamp, provider, model, connectionId, apiKey, endpoint FROM usageHistory WHERE timestamp >= ?`,
       [new Date(overlayCutoff).toISOString()]
@@ -642,7 +659,9 @@ export async function getUsageStats(period = "all") {
         const keyInfo = apiKeyMap[r.apiKey];
         const keyName = keyInfo?.name || r.apiKey.slice(0, 8) + "...";
         const apiKeyMasked = maskApiKey(r.apiKey);
-        const akKey = `${apiKeyMasked}|${r.model}|${r.provider || "unknown"}`;
+        // Key by the FULL api key (same as the daily rollup + lastUsed overlay)
+        // — masking here collided all keys sharing a prefix into one bucket.
+        const akKey = `${r.apiKey}|${r.model}|${r.provider || "unknown"}`;
         if (!stats.byApiKey[akKey]) {
           stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel: r.model, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey: apiKeyMasked, lastUsed: r.timestamp };
         }
@@ -670,10 +689,14 @@ export async function getUsageStats(period = "all") {
   }
 
   stats.totalRequests = Object.values(stats.byProvider).reduce((sum, p) => sum + (p.requests || 0), 0);
+  statsCache[period] = { data: stats, ts: Date.now() };
   return stats;
 }
 
 export async function getChartData(period = "7d") {
+  const cached = chartCache[period];
+  if (cached && Date.now() - cached.ts < STATS_CACHE_TTL_MS) return cached.data;
+
   const db = await getAdapter();
   const now = Date.now();
 
@@ -685,7 +708,7 @@ export async function getChartData(period = "7d") {
     const startTime = startOfDay.getTime();
     const endTime = startTime + bucketCount * bucketMs;
     const labelFn = (ts) => new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
-    const buckets = Array.from({ length: bucketCount }, (_, i) => ({ label: labelFn(startTime + i * bucketMs), tokens: 0, cost: 0 }));
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({ label: labelFn(startTime + i * bucketMs), tokens: 0, cost: 0, requests: 0 }));
 
     const rows = db.all(
       `SELECT timestamp, promptTokens, completionTokens, cost FROM usageHistory WHERE timestamp >= ?`,
@@ -698,6 +721,7 @@ export async function getChartData(period = "7d") {
       if (idx >= 0 && idx < bucketCount) {
         buckets[idx].tokens += (r.promptTokens || 0) + (r.completionTokens || 0);
         buckets[idx].cost += r.cost || 0;
+        buckets[idx].requests += 1;
       }
     }
     return buckets;
@@ -708,7 +732,7 @@ export async function getChartData(period = "7d") {
     const bucketMs = 3600000;
     const labelFn = (ts) => new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
     const startTime = now - bucketCount * bucketMs;
-    const buckets = Array.from({ length: bucketCount }, (_, i) => ({ label: labelFn(startTime + i * bucketMs), tokens: 0, cost: 0 }));
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({ label: labelFn(startTime + i * bucketMs), tokens: 0, cost: 0, requests: 0 }));
 
     const rows = db.all(
       `SELECT timestamp, promptTokens, completionTokens, cost FROM usageHistory WHERE timestamp >= ?`,
@@ -720,20 +744,49 @@ export async function getChartData(period = "7d") {
       const idx = Math.min(Math.floor((t - startTime) / bucketMs), bucketCount - 1);
       buckets[idx].tokens += (r.promptTokens || 0) + (r.completionTokens || 0);
       buckets[idx].cost += r.cost || 0;
+      buckets[idx].requests += 1;
     }
+    return buckets;
+  }
+
+  const labelFn = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+
+  if (period === "all") {
+    const dayRows = loadDaysInRange(db, null);
+    if (!dayRows.length) return [];
+    const dayMap = {};
+    for (const r of dayRows) dayMap[r.dateKey] = parseJson(r.data, {});
+
+    const earliest = new Date(dayRows[0].dateKey + "T00:00:00");
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const diffDays = Math.max(1, Math.round((today - earliest) / 86400000) + 1);
+
+    const buckets = Array.from({ length: diffDays }, (_, i) => {
+      const d = new Date(earliest);
+      d.setDate(d.getDate() + i);
+      const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const dayData = dayMap[dateKey];
+      return {
+        label: labelFn(d),
+        tokens: dayData ? (dayData.promptTokens || 0) + (dayData.completionTokens || 0) : 0,
+        cost: dayData ? (dayData.cost || 0) : 0,
+        requests: dayData ? (dayData.requests || 0) : 0,
+      };
+    });
+    chartCache[period] = { data: buckets, ts: Date.now() };
     return buckets;
   }
 
   const bucketCount = period === "7d" ? 7 : period === "30d" ? 30 : 60;
   const today = new Date();
-  const labelFn = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
   // Build map of dateKey → day data
   const dayRows = loadDaysInRange(db, bucketCount);
   const dayMap = {};
   for (const r of dayRows) dayMap[r.dateKey] = parseJson(r.data, {});
 
-  return Array.from({ length: bucketCount }, (_, i) => {
+  const buckets = Array.from({ length: bucketCount }, (_, i) => {
     const d = new Date(today);
     d.setDate(d.getDate() - (bucketCount - 1 - i));
     const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -742,8 +795,11 @@ export async function getChartData(period = "7d") {
       label: labelFn(d),
       tokens: dayData ? (dayData.promptTokens || 0) + (dayData.completionTokens || 0) : 0,
       cost: dayData ? (dayData.cost || 0) : 0,
+      requests: dayData ? (dayData.requests || 0) : 0,
     };
   });
+  chartCache[period] = { data: buckets, ts: Date.now() };
+  return buckets;
 }
 
 function formatLogDate(date = new Date()) {

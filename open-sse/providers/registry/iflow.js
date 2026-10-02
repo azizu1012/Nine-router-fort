@@ -38,8 +38,8 @@ export default {
     { id: "iflow-rome-30ba3b", name: "iFlow ROME" },
   ],
   oauth: {
-    clientId: "10009311001",
-    clientSecret: "4Z3YjXycVsQvyGF1etiNlIBB4RsqSDtW",
+    clientId: process.env.IFLOW_CLIENT_ID,
+    clientSecret: process.env.IFLOW_CLIENT_SECRET,
     authorizeUrl: "https://iflow.cn/oauth",
     tokenUrl: "https://iflow.cn/oauth/token",
     userInfoUrl: "https://iflow.cn/api/oauth/getUserInfo",

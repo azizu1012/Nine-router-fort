@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Badge, Button, Card, CardSkeleton, Input, Modal, Toggle, ConfirmModal } from "@/shared/components";
 import { useNotificationStore } from "@/store/notificationStore";
+import { dedupe } from "@/store/pageDataStore";
 
 function getStatusVariant(status) {
   if (status === "active") return "success";
@@ -68,11 +69,10 @@ export default function ProxyPoolsPage() {
 
   const fetchProxyPools = useCallback(async () => {
     try {
-      const res = await fetch("/api/proxy-pools?includeUsage=true", { cache: "no-store" });
-      const data = await res.json();
-      if (res.ok) {
-        setProxyPools(data.proxyPools || []);
-      }
+      const data = await dedupe("proxy-pools:list", () =>
+        fetch("/api/proxy-pools?includeUsage=true", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null))
+      );
+      if (data) setProxyPools(data.proxyPools || []);
     } catch (error) {
       console.log("Error fetching proxy pools:", error);
     } finally {

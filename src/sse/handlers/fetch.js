@@ -13,7 +13,9 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+
+import { withApiKeyLimits } from "../services/auth.js";
 
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
@@ -21,8 +23,8 @@ import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
  *
  * @param {Request} request
  */
-import { withApiKeyLimits } from "../services/auth.js";
-
+// Per-API-key gate: provider allow-list + concurrency/TPM/RPD limits.
+// The concurrency counter is held for the whole stream, not just the handshake.
 export async function handleFetch(request) {
   return withApiKeyLimits(request, handleFetchInner);
 }
@@ -85,9 +87,10 @@ async function handleFetchInner(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid URL format");
   }
 
-  // SSRF guard: reject internal/private/metadata targets
+  // SSRF guard: reject internal/private/metadata targets, including
+  // hostnames that merely resolve to one (DNS lookup, not just literal checks).
   try {
-    assertPublicUrl(targetUrl);
+    await assertPublicUrlResolved(targetUrl);
   } catch (err) {
     log.warn("FETCH", "Blocked URL", { url: targetUrl });
     return errorResponse(HTTP_STATUS.BAD_REQUEST, err.message);
@@ -164,8 +167,13 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
   let lastError = null;
   let lastStatus = null;
 
+  // Keep web-fetch failures scoped to this capability. Providers such as
+  // Ollama use the same connection for chat and fetch, so an upstream fetch
+  // failure must not take the account offline for LLM requests.
+  const fetchLockKey = `webfetch:${providerId}`;
+
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    const credentials = await getProviderCredentials(providerId, excludeConnectionIds, fetchLockKey);
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -201,19 +209,23 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
           providerSpecificData: newCreds.providerSpecificData,
           testStatus: "active"
         });
-      },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials);
       }
     });
 
     if (result.success) {
+      await clearAccountError(credentials.connectionId, credentials, fetchLockKey);
       return new Response(JSON.stringify(result.data), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, providerId);
+    const { shouldFallback } = await markAccountUnavailable(
+      credentials.connectionId,
+      result.status,
+      result.error,
+      providerId,
+      fetchLockKey,
+    );
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);

@@ -13,20 +13,43 @@ const proxyClientMaxBodySize = process.env.NINEROUTER_PROXY_CLIENT_MAX_BODY_SIZE
 const nextConfig = {
   distDir: process.env.NEXT_DIST_DIR || ".next",
   output: "standalone",
-  serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite"],
+  // `open` must stay external. It derives its own directory from `import.meta.url`, and
+  // webpack replaces that with the absolute path of the BUILD machine as a string literal.
+  // A release built on macOS therefore ships `file:///Users/.../open/index.js`, which
+  // `fileURLToPath` rejects on Windows ("File URL path must be absolute" — no drive
+  // letter). That throw happens at module scope, so every consumer of `open` dies on
+  // import — including xAI/Grok token refresh, which loads the OAuth service that imports
+  // it. Keeping it external preserves the real `import.meta.url` at runtime.
+  serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite", "open"],
   turbopack: {
     root: tracingRoot
   },
   outputFileTracingRoot: tracingRoot,
   outputFileTracingExcludes: {
-    "*": [
-      "./gitbook/**/*",
-      "**/CherryStudio/**",
-      // Windows junction-point symlinks that deny scandir (EPERM)
-      "**/Application Data/**",
-      "**/Local Settings/**",
-      "**/{Cookies,SendTo,Start Menu,Templates,PrintHood,NetHood,Recent,My Documents}/**",
-    ]
+    // Runtime state and dev-only trees must never be baked into the standalone
+    // bundle. The file tracer cannot resolve every path the app touches at
+    // runtime (homedir(), %APPDATA%, process.cwd()), so a few entries end up
+    // with an over-broad trace and the standalone bundle picks up directories
+    // that must not ship. `data/` is DATA_DIR: the live SQLite DB holding every
+    // provider OAuth token/API key, plus the 54MB cloudflared binary and the MITM
+    // CA. Shipping it leaks credentials into a deployable artifact, adds ~65MB,
+    // and makes the build fail with ENOENT when a file is pruned mid-copy.
+    //
+    // Patterns are resolved as path.join(tracingRoot, pattern), so they must stay
+    // root-anchored and must NOT use a leading "**/": that would also match inside
+    // node_modules (e.g. "**/i18n/**" strips next/dist/shared/lib/i18n and the
+    // server dies on boot with "Cannot find module .../normalize-locale-path").
+    //
+    // The route key must be a glob picomatch matches against the entry name
+    // ("middleware", "/api/v1/models", ...), hence "**/*" rather than "*"/"/*".
+    "**/*": [
+      "data/**",
+      "logs/**",
+      "tests/**",
+      "docs/**",
+      "gitbook/**",
+      "open-sse.old/**",
+    ],
   },
   images: {
     unoptimized: true
@@ -37,6 +60,8 @@ const nextConfig = {
     proxyClientMaxBodySize,
     // Cache fetch responses across HMR refreshes for faster dev reloads.
     serverComponentsHmrCache: true,
+    // Tree-shake heavy barrel imports to cut compile + bundle size
+    optimizePackageImports: ["@xyflow/react", "@dnd-kit/core", "@dnd-kit/sortable", "material-symbols", "marked"],
   },
   webpack: (config, { isServer }) => {
     // Ignore fs/path modules in browser bundle
@@ -72,6 +97,10 @@ const nextConfig = {
       {
         source: "/responses",
         destination: "/api/v1/responses"
+      },
+      {
+        source: "/systemone",
+        destination: "/api/v1/systemone"
       },
       {
         source: "/v1beta/:path*",

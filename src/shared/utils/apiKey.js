@@ -29,10 +29,17 @@ function generateCrc(machineId, keyId) {
  * Generate API key with machineId embedded
  * Format: sk-{machineId}-{keyId}-{crc8}
  * @param {string} machineId - 16-char machine ID
+ * @param {string|null} [customKeyId] - caller-supplied key id (e.g. "team_1234").
+ *   Sanitized to [a-z0-9_]{1,24} and rejected if it contains anything else, so a
+ *   custom id can never forge the machineId/CRC fields.
  * @returns {{ key: string, keyId: string }}
  */
 export function generateApiKeyWithMachine(machineId, customKeyId = null) {
-  const keyId = customKeyId || generateKeyId();
+  let keyId = generateKeyId();
+  if (typeof customKeyId === "string") {
+    const clean = customKeyId.toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 24);
+    if (clean) keyId = clean;
+  }
   const crc = generateCrc(machineId, keyId);
   const key = `sk-${machineId}-${keyId}-${crc}`;
   return { key, keyId };

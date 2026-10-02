@@ -14,6 +14,8 @@ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tok
 import { handleComboChat } from "open-sse/services/combo.js";
 import * as log from "../utils/logger.js";
 
+import { withApiKeyLimits } from "../services/auth.js";
+
 // Providers that don't require credentials (noAuth)
 const NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
 
@@ -21,8 +23,8 @@ const NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
  * Handle image generation request
  * @param {Request} request
  */
-import { withApiKeyLimits } from "../services/auth.js";
-
+// Per-API-key gate: provider allow-list + concurrency/TPM/RPD limits.
+// The concurrency counter is held for the whole stream, not just the handshake.
 export async function handleImageGeneration(request) {
   return withApiKeyLimits(request, handleImageGenerationInner);
 }

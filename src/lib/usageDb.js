@@ -5,3 +5,4 @@ export {
   appendRequestLog, getRecentLogs,
   saveRequestDetail, getRequestDetails, getRequestDetailById,
 } from "@/lib/db/index.js";
+export { invalidateUsageCaches } from "@/lib/db/repos/usageRepo.js";

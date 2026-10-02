@@ -29,11 +29,13 @@ export async function POST(request) {
     const machineId = await getConsistentMachineId();
     const apiKey = await createApiKey(name, machineId, {
       customPrefix,
-      allowedProviders,
-      limitTpm: limitTpm ? parseInt(limitTpm, 10) : null,
-      limitRpd: limitRpd ? parseInt(limitRpd, 10) : null,
-      limitConcurrency: limitConcurrency ? parseInt(limitConcurrency, 10) : null,
+      allowedProviders: Array.isArray(allowedProviders) ? allowedProviders : undefined,
+      limitTpm,
+      limitRpd,
+      limitConcurrency,
     });
+    const { invalidateApiKeyCache } = await import("@/sse/services/auth.js");
+    invalidateApiKeyCache();
 
     return NextResponse.json({
       key: apiKey.key,

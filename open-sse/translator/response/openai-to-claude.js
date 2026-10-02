@@ -190,28 +190,24 @@ export function openaiToClaudeResponse(chunk, state) {
         stopTextBlock(state, results);
 
         const toolBlockIndex = state.nextBlockIndex++;
-        
+        state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
+
         // Strip prefix from tool name for response
         let toolName = tc.function?.name || "";
         if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         }
 
-        const isAgentUse = toolName === "Task";
-        state.toolCalls.set(idx, { id: tc.id, name: toolName, blockIndex: toolBlockIndex, isAgentUse });
-
-        if (!isAgentUse) {
-          results.push({
-            type: "content_block_start",
-            index: toolBlockIndex,
-            content_block: {
-              type: CLAUDE_BLOCK.TOOL_USE,
-              id: tc.id,
-              name: toolName,
-              input: {}
-            }
-          });
-        }
+        results.push({
+          type: "content_block_start",
+          index: toolBlockIndex,
+          content_block: {
+            type: CLAUDE_BLOCK.TOOL_USE,
+            id: tc.id,
+            name: toolName,
+            input: {}
+          }
+        });
       }
 
       if (tc.function?.arguments) {
@@ -231,45 +227,20 @@ export function openaiToClaudeResponse(chunk, state) {
     stopTextBlock(state, results);
 
     for (const [idx, toolInfo] of state.toolCalls) {
+      // Emit buffered + sanitized args as single delta before stop
       const buffered = state.toolArgBuffers?.get(idx);
-      if (toolInfo.isAgentUse) {
-        let prompt = buffered || "";
-        try {
-          const parsed = JSON.parse(buffered);
-          prompt = parsed.prompt || buffered;
-        } catch {
-          // ignore
-        }
-        
+      if (buffered) {
+        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
         results.push({
-          type: "content_block_start",
+          type: "content_block_delta",
           index: toolInfo.blockIndex,
-          content_block: {
-            type: CLAUDE_BLOCK.AGENT_USE,
-            id: toolInfo.id,
-            agent_type: "general-purpose",
-            prompt: prompt
-          }
-        });
-        results.push({
-          type: "content_block_stop",
-          index: toolInfo.blockIndex
-        });
-      } else {
-        // Emit buffered + sanitized args as single delta before stop
-        if (buffered) {
-          const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
-          results.push({
-            type: "content_block_delta",
-            index: toolInfo.blockIndex,
-            delta: { type: "input_json_delta", partial_json: sanitized }
-          });
-        }
-        results.push({
-          type: "content_block_stop",
-          index: toolInfo.blockIndex
+          delta: { type: "input_json_delta", partial_json: sanitized }
         });
       }
+      results.push({
+        type: "content_block_stop",
+        index: toolInfo.blockIndex
+      });
     }
 
     // Mark finish for later usage injection in stream.js

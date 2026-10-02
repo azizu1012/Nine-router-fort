@@ -1,6 +1,7 @@
-// Route handlers are server-side by default in App Router
+"use server";
 
 import { NextResponse } from "next/server";
+import { resolveCliApiKey } from "../resolveApiKey.js";
 import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs/promises";
@@ -36,8 +37,8 @@ const readConfig = async () => {
   try {
     const content = await fs.readFile(getConfigPath(), "utf-8");
     // opencode config files may use JSONC format (trailing commas, comments).
-    // Strip BOM mark and trailing commas before parsing to avoid SyntaxError on valid JSONC.
-    const stripped = content.replace(/^\uFEFF/, "").replace(/,(\s*[}\]])/g, "$1");
+    // Strip trailing commas before parsing to avoid SyntaxError on valid JSONC.
+    const stripped = content.replace(/,(\s*[}\]])/g, "$1");
     return JSON.parse(stripped);
   } catch (error) {
     if (error.code === "ENOENT") return null;
@@ -108,11 +109,11 @@ export async function POST(request) {
     let config = {};
     try {
       const existing = await fs.readFile(configPath, "utf-8");
-      config = JSON.parse(existing.replace(/^\uFEFF/, ""));
+      config = JSON.parse(existing);
     } catch { /* No existing config */ }
 
     const normalizedBaseUrl = baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`;
-    const keyToUse = apiKey || "sk_9router";
+    const keyToUse = await resolveCliApiKey(apiKey);
     const effectiveSubagentModel = subagentModel || modelsArray[0];
 
     // Ensure provider object
@@ -181,7 +182,7 @@ export async function PATCH(request) {
     let config = {};
     try {
       const existing = await fs.readFile(configPath, "utf-8");
-      config = JSON.parse(existing.replace(/^\uFEFF/, ""));
+      config = JSON.parse(existing);
     } catch (error) {
       if (error.code === "ENOENT") {
         return NextResponse.json({ success: true, message: "No config file found" });
@@ -218,7 +219,7 @@ export async function DELETE(request) {
     let config = {};
     try {
       const existing = await fs.readFile(configPath, "utf-8");
-      config = JSON.parse(existing.replace(/^\uFEFF/, ""));
+      config = JSON.parse(existing);
     } catch (error) {
       if (error.code === "ENOENT") {
         return NextResponse.json({ success: true, message: "No config file to reset" });
