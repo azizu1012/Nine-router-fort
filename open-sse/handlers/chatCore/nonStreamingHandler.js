@@ -250,6 +250,55 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
       }
       openaiResponse = result;
     }
+  } else if (targetFormat === FORMATS.OPENAI_RESPONSES) {
+    if (responseBody.output && Array.isArray(responseBody.output)) {
+      let textContent = "", reasoningContent = "";
+      const toolCalls = [];
+
+      for (const item of responseBody.output) {
+        if (item.type === "message") {
+          for (const part of item.content || []) {
+            if (part.type === "output_text") textContent += part.text || "";
+          }
+        } else if (item.type === "reasoning") {
+          for (const summary of item.summary || []) {
+            if (summary.type === "summary_text") reasoningContent += summary.text || "";
+          }
+        } else if (item.type === "function_call" || item.type === "custom_tool_call") {
+          const toolInput = item.arguments || (item.input ? JSON.stringify({input: item.input}) : "{}");
+          toolCalls.push({
+            id: item.call_id || item.id,
+            type: "function",
+            function: { name: item.name, arguments: toolInput }
+          });
+        }
+      }
+
+      const message = { role: "assistant" };
+      if (textContent) message.content = textContent;
+      if (reasoningContent) message.reasoning_content = reasoningContent;
+      if (toolCalls.length > 0) message.tool_calls = toolCalls;
+      if (!message.content && !message.tool_calls) message.content = "";
+
+      let finishReason = responseBody.status === "completed" ? (toolCalls.length > 0 ? "tool_calls" : "stop") : (responseBody.status || "stop");
+
+      const result = {
+        id: `chatcmpl-${responseBody.id || Date.now()}`.replace(/^chatcmpl-resp_/, "chatcmpl-"),
+        object: "chat.completion",
+        created: responseBody.created_at || Math.floor(Date.now() / 1000),
+        model: responseBody.model || "unknown",
+        choices: [{ index: 0, message, finish_reason: finishReason }]
+      };
+
+      if (responseBody.usage) {
+        result.usage = {
+          prompt_tokens: responseBody.usage.input_tokens || 0,
+          completion_tokens: responseBody.usage.output_tokens || 0,
+          total_tokens: responseBody.usage.total_tokens || 0
+        };
+      }
+      openaiResponse = result;
+    }
   } else if (targetFormat === FORMATS.OLLAMA) {
     openaiResponse = ollamaBodyToOpenAI(responseBody);
   }
