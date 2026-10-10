@@ -1,5 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
+import { keyAccessFromColumns, keyAccessToColumns } from "@/shared/utils/keyAccess.js";
+import { KEY_ACCESS_UNRESTRICTED } from "@/shared/constants/keyAccess.js";
 
 function parseList(value) {
   if (!value) return null;
@@ -21,6 +23,7 @@ function rowToKey(row) {
     machineId: row.machineId,
     isActive: row.isActive === 1 || row.isActive === true,
     createdAt: row.createdAt,
+    access: keyAccessFromColumns(row.accessRestricted, row.accessAllow),
     allowedProviders: parseList(row.allowedProviders),
     limitTpm: row.limitTpm || null,
     limitRpd: row.limitRpd || null,
@@ -46,6 +49,7 @@ export async function getApiKeyById(id) {
   return rowToKey(row);
 }
 
+// Used by the /v1 handlers to read the presented key's access settings.
 export async function getApiKeyByKey(key) {
   if (!key) return null;
   const db = await getAdapter();
@@ -80,15 +84,18 @@ export async function createApiKey(name, machineId, options = {}) {
     machineId,
     isActive: true,
     createdAt: new Date().toISOString(),
+    access: { restricted: false, allow: [] },
     allowedProviders,
     limitTpm: normalizeLimit(options.limitTpm),
     limitRpd: normalizeLimit(options.limitRpd),
     limitConcurrency: normalizeLimit(options.limitConcurrency),
   };
+  const cols = keyAccessToColumns(KEY_ACCESS_UNRESTRICTED);
   db.run(
-    `INSERT INTO apiKeys(id, key, name, machineId, isActive, createdAt, allowedProviders, limitTpm, limitRpd, limitConcurrency) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO apiKeys(id, key, name, machineId, isActive, createdAt, accessRestricted, accessAllow, allowedProviders, limitTpm, limitRpd, limitConcurrency) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       apiKey.id, apiKey.key, apiKey.name, apiKey.machineId, 1, apiKey.createdAt,
+      cols.accessRestricted, cols.accessAllow,
       apiKey.allowedProviders ? JSON.stringify(apiKey.allowedProviders) : null,
       apiKey.limitTpm, apiKey.limitRpd, apiKey.limitConcurrency,
     ]
@@ -103,6 +110,7 @@ export async function updateApiKey(id, data) {
     const row = db.get(`SELECT * FROM apiKeys WHERE id = ?`, [id]);
     if (!row) return;
     const merged = { ...rowToKey(row), ...data };
+    const cols = keyAccessToColumns(merged.access);
     if ("allowedProviders" in data) {
       merged.allowedProviders = Array.isArray(data.allowedProviders) && data.allowedProviders.length
         ? data.allowedProviders
@@ -112,14 +120,15 @@ export async function updateApiKey(id, data) {
       if (field in data) merged[field] = normalizeLimit(data[field]);
     }
     db.run(
-      `UPDATE apiKeys SET key = ?, name = ?, machineId = ?, isActive = ?, allowedProviders = ?, limitTpm = ?, limitRpd = ?, limitConcurrency = ? WHERE id = ?`,
+      `UPDATE apiKeys SET key = ?, name = ?, machineId = ?, isActive = ?, accessRestricted = ?, accessAllow = ?, allowedProviders = ?, limitTpm = ?, limitRpd = ?, limitConcurrency = ? WHERE id = ?`,
       [
-        merged.key, merged.name, merged.machineId, merged.isActive ? 1 : 0,
+        merged.key, merged.name, merged.machineId, merged.isActive ? 1 : 0, 
+        cols.accessRestricted, cols.accessAllow,
         merged.allowedProviders ? JSON.stringify(merged.allowedProviders) : null,
         merged.limitTpm, merged.limitRpd, merged.limitConcurrency, id,
       ]
     );
-    result = merged;
+    result = rowToKey(db.get(`SELECT * FROM apiKeys WHERE id = ?`, [id]));
   });
   return result;
 }

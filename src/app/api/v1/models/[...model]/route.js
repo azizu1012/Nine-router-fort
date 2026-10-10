@@ -1,4 +1,5 @@
 import { buildModelsList, resolveModelScope } from "../route.js";
+import { getKeyAccessContext, filterModelsListForKey } from "@/sse/services/keyAccess.js";
 
 // URL slug → service kind(s). `web` covers both webSearch and webFetch.
 const KIND_SLUG_MAP = {
@@ -43,18 +44,17 @@ export async function GET(request, { params }) {
     const path = Array.isArray(model) ? model : [model];
     const identifier = path.filter(Boolean).join("/");
     const kindFilter = path.length === 1 ? KIND_SLUG_MAP[identifier] : null;
-    // Restrict the catalogue to the API key's provider allow-list, so a limited
-    // key cannot enumerate model ids it may not route to.
+    const keyAccess = await getKeyAccessContext(request);
     const allowedProviders = await resolveModelScope(request);
 
     if (kindFilter) {
-      const data = await buildModelsList(kindFilter, { allowedProviders });
+      const data = await filterModelsListForKey(keyAccess, await buildModelsList(kindFilter, { allowedProviders }));
       return json({ object: "list", data });
     }
 
     // Match the same LLM catalog exposed by GET /v1/models. A catch-all
     // parameter is required because provider-prefixed IDs contain a slash.
-    const models = await buildModelsList([LLM_KIND], { allowedProviders });
+    const models = await filterModelsListForKey(keyAccess, await buildModelsList([LLM_KIND], { allowedProviders }));
     const matchedModel = models.find((candidate) => candidate.id === identifier);
 
     if (!matchedModel) {

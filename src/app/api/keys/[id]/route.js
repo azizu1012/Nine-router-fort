@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteApiKey, getApiKeyById, updateApiKey } from "@/lib/localDb";
+import { validateKeyAccessInput } from "@/shared/utils/keyAccess.js";
 
 // GET /api/keys/[id] - Get single key
 export async function GET(request, { params }) {
@@ -21,7 +22,7 @@ export async function PUT(request, { params }) {
   try {
     const { id } = await params;
     const body = await request.json();
-    const { isActive, name, allowedProviders, limitTpm, limitRpd, limitConcurrency } = body;
+    const { isActive, name, allowedProviders, limitTpm, limitRpd, limitConcurrency, access } = body;
 
     const existing = await getApiKeyById(id);
     if (!existing) {
@@ -30,6 +31,11 @@ export async function PUT(request, { params }) {
 
     const updateData = {};
     if (isActive !== undefined) updateData.isActive = isActive;
+    if (access !== undefined) {
+      const checked = validateKeyAccessInput(access);
+      if (!checked.ok) return NextResponse.json({ error: checked.error }, { status: 400 });
+      updateData.access = checked.value;
+    }
     if (typeof name === "string" && name.trim()) updateData.name = name.trim();
     if (allowedProviders !== undefined) {
       updateData.allowedProviders = Array.isArray(allowedProviders) ? allowedProviders : null;
@@ -56,10 +62,14 @@ export async function PUT(request, { params }) {
 export async function DELETE(request, { params }) {
   try {
     const { id } = await params;
+    const existing = await getApiKeyById(id);
+    if (!existing) {
+      return NextResponse.json({ error: "Key not found" }, { status: 404 });
+    }
 
     const deleted = await deleteApiKey(id);
     if (!deleted) {
-      return NextResponse.json({ error: "Key not found" }, { status: 404 });
+      return NextResponse.json({ error: "Failed to delete key" }, { status: 500 });
     }
 
     // Drop the deleted key's counters so its concurrency slot is freed at once.
