@@ -179,6 +179,26 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Expose raw client headers to translators/executors for session-id resolution
   if (credentials) credentials.rawHeaders = clientRawRequest?.headers || {};
 
+  // Strip tools for Claude Code / OpenCode /compact summarization requests.
+  // When clients request a summary of the conversation, they often blindly pass all
+  // tools (Bash, etc.) in the request. Agent models may get distracted and attempt to
+  // use tools instead of generating the text summary, causing "no assistant message" errors.
+  if (body.tools && body.tools.length > 0 && body.messages && body.messages.length > 0) {
+    const lastMsg = body.messages[body.messages.length - 1];
+    if (lastMsg.role === "user") {
+      const contentStr = typeof lastMsg.content === 'string' ? lastMsg.content : 
+        (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
+        
+      if (contentStr.includes("Write a summary of this conversation") || 
+          (contentStr.includes("Write a summary") && contentStr.includes("conversation")) ||
+          contentStr.includes("Compacting conversation")) {
+        delete body.tools;
+        delete body.tool_choice;
+        log?.debug?.("TOOLS", "Stripped tools for /compact summarization request");
+      }
+    }
+  }
+
   // Auto-strip media blocks the model can't read (vision/audio/pdf) before translation.
   if (!passthrough) {
     const caps = getCapabilitiesForModel(provider, model);
