@@ -11,6 +11,7 @@ import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
+import { detectClientTool } from "../../utils/clientDetector.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
 
@@ -398,13 +399,36 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
   }
 
+  const clientTool = detectClientTool(clientRawRequest?.headers || {}, body);
+
+  // Extract <think> tags from content into reasoning_content for non-streaming clients
+  if (translatedResponse?.choices) {
+    for (const choice of translatedResponse.choices) {
+      if (choice?.message?.content && typeof choice.message.content === "string") {
+        const content = choice.message.content;
+        const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+        if (thinkMatch) {
+          const thinkingText = thinkMatch[1].trim();
+          if (thinkingText) {
+            choice.message.reasoning_content = (choice.message.reasoning_content ? choice.message.reasoning_content + "\n" : "") + thinkingText;
+          }
+          choice.message.content = content.replace(/<think>[\s\S]*?<\/think>\s*/, "");
+        }
+      }
+    }
+  }
+
   // Strip reasoning_content only when content is non-empty.
   // When content is empty (e.g. thinking models that used all tokens for reasoning),
   // reasoning_content is the only useful output and must be preserved.
+  // Do not strip reasoning_content for codex/opencode/claude as they expect it for proper UI rendering.
   if (!isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
-    for (const choice of translatedResponse.choices) {
-      if (choice?.message?.reasoning_content && choice.message.content) {
-        delete choice.message.reasoning_content;
+    const keepReasoning = ["codex", "opencode", "claude"].includes(clientTool);
+    if (!keepReasoning) {
+      for (const choice of translatedResponse.choices) {
+        if (choice?.message?.reasoning_content && choice.message.content) {
+          delete choice.message.reasoning_content;
+        }
       }
     }
   }
