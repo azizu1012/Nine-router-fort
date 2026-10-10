@@ -47,7 +47,18 @@ function openAICompletionToClaudeMessage(responseBody) {
       input: parseToolArguments(fn.arguments || toolCall.arguments),
     });
   }
-  if (content.length === 0) content.push({ type: "text", text: "" });
+  
+  // If no text was returned but we have reasoning (common when model used budget for thinking),
+  // copy the reasoning to a text block so clients that expect text (e.g. Claude Code compaction) don't crash.
+  const hasText = content.some(c => c.type === "text");
+  const hasToolUse = content.some(c => c.type === "tool_use");
+  if (!hasText) {
+    if (reasoning && !hasToolUse) {
+      content.push({ type: "text", text: reasoning });
+    } else {
+      content.push({ type: "text", text: "" });
+    }
+  }
 
   const usage = responseBody.usage || {};
   return {

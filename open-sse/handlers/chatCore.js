@@ -189,9 +189,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       const contentStr = typeof lastMsg.content === 'string' ? lastMsg.content : 
         (Array.isArray(lastMsg.content) ? lastMsg.content.map(c => c.text || '').join(' ') : '');
         
-      if (contentStr.includes("Write a summary of this conversation") || 
+      const isExplicitCompaction = contentStr.includes("Write a summary of this conversation") || 
           (contentStr.includes("Write a summary") && contentStr.includes("conversation")) ||
-          contentStr.includes("Compacting conversation")) {
+          contentStr.includes("Compacting conversation") ||
+          contentStr.includes("summary of the conversation");
+          
+      // For claude code, /compact is typically non-streaming. If it's non-streaming and has tools, 
+      // it's highly likely a compaction request where tools should be stripped to avoid distraction.
+      const isClaudeNonStreamingCompaction = (clientTool === "claude" || clientTool === "opencode") && body.stream !== true;
+
+      if (isExplicitCompaction || isClaudeNonStreamingCompaction) {
         delete body.tools;
         delete body.tool_choice;
         log?.debug?.("TOOLS", "Stripped tools for /compact summarization request");
