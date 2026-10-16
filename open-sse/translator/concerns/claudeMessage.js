@@ -35,17 +35,19 @@ export function openAICompletionToClaudeMessage(responseBody) {
     });
   }
   // A reasoning-only turn is common when the model spends its whole budget thinking.
-// Claude Code's /compact reads the assistant text block and crashes without one,
-// so copy the reasoning into a text block when nothing else carries text.
-const hasText = content.some((c) => c.type === CLAUDE_BLOCK.TEXT);
-const hasToolUse = content.some((c) => c.type === CLAUDE_BLOCK.TOOL_USE);
-if (!hasText) {
-  if (reasoning && !hasToolUse) {
-    content.push({ type: CLAUDE_BLOCK.TEXT, text: reasoning });
-  } else {
-    content.push({ type: CLAUDE_BLOCK.TEXT, text: "" });
+  // Claude Code's /compact reads the assistant text block and crashes without one,
+  // so copy the reasoning into a text block. A turn that already carries a tool
+  // call keeps its exact block list — the client drives the tool loop off it — and
+  // only a genuinely empty turn falls back to the empty text block.
+  const hasText = content.some((c) => c.type === CLAUDE_BLOCK.TEXT);
+  if (!hasText) {
+    const hasToolUse = content.some((c) => c.type === CLAUDE_BLOCK.TOOL_USE);
+    if (reasoning && !hasToolUse) {
+      content.push({ type: CLAUDE_BLOCK.TEXT, text: reasoning });
+    } else if (content.length === 0) {
+      content.push({ type: CLAUDE_BLOCK.TEXT, text: "" });
+    }
   }
-}
 
   const usage = responseBody.usage || {};
   return {
