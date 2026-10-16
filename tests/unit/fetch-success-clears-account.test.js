@@ -18,6 +18,7 @@ vi.mock("@/sse/services/auth.js", () => ({
   clearAccountError: mocks.clearAccountError,
   extractApiKey: mocks.extractApiKey,
   isValidApiKey: mocks.isValidApiKey,
+  withApiKeyLimits: async (request, innerHandler) => (typeof innerHandler === "function" ? innerHandler(request) : innerHandler),
 }));
 
 vi.mock("@/lib/localDb", () => ({

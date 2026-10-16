@@ -362,9 +362,11 @@ export async function buildModelsList(kindFilter, options = {}) {
   // `allowedProviders` is already expanded to the prefixes each selected
   // connection publishes, so both filters below are plain set lookups.
   let isModelRefAllowed = null;
+  let isConnectionAllowed = null;
   if (allowedProviders) {
     const scope = await import("@/sse/services/auth.js");
     isModelRefAllowed = scope.isModelRefAllowed;
+    isConnectionAllowed = scope.isConnectionAllowed;
     connections = connections.filter((c) => scope.isConnectionAllowed(c, allowedProviders));
     const combosByName = new Map(
       combos.filter((c) => typeof c?.name === "string").map((c) => [c.name, c]),
@@ -406,6 +408,9 @@ export async function buildModelsList(kindFilter, options = {}) {
   // Include no-auth free providers (e.g. opencode) so their models are exposed in /v1/models
   for (const [id, provider] of Object.entries(FREE_PROVIDERS || {})) {
     if (provider?.noAuth && !activeConnectionByProvider.has(id)) {
+      if (allowedProviders && isConnectionAllowed && !isConnectionAllowed({ provider: id }, allowedProviders)) {
+        continue;
+      }
       activeConnectionByProvider.set(id, {
         id: "noauth",
         provider: id,

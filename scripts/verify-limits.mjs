@@ -66,8 +66,12 @@ try {
   check("bare ids are combos (resolved by seat)", combos.length >= 0, `combos=${combos.join(",") || "none"}`);
 
   // Use a REAL model id from the scoped list, otherwise the upstream 404s and no
-  // usage row is written, so the TPM meter never moves.
-  const realModel = ids.find((x) => x.includes("/"));
+  // usage row is written, so the TPM meter never moves. Prefer a stable/common
+  // model (e.g. Flash) before experimental tiers (e.g. Argon).
+  const realModel =
+    process.env.PINNED_MODEL
+    || ids.find((x) => x.includes("/") && /flash|3\.8|sonnet|gpt/i.test(x))
+    || ids.find((x) => x.includes("/"));
   console.log(`  (using real model "${realModel}" for the limit tests)`);
 
   console.log("\n[2] concurrency limit: 2nd simultaneous request is refused");
