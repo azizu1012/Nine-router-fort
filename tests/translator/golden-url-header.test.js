@@ -26,11 +26,25 @@ const SPECIALIZED = new Set([
 // Per-process / per-request values: kimi's random device name, minimax's session UUID.
 const VOLATILE_HEADERS = new Set(["x-msh-device-name", "x-mavis-session-id"]);
 
+// Values derived from package.json / host OS. Normalize them so the golden
+// snapshot stays green across releases and across Linux CI vs Windows dev —
+// otherwise every version bump or platform switch rewrites these entries.
+const ENV_HEADERS = new Map([
+  ["user-agent", (v) => v.replace(/9Router\/[\w.-]+/g, "9Router/<VERSION>")],
+  ["x-client-version", () => "<VERSION>"],
+  ["x-core-version", () => "<VERSION>"],
+  ["x-platform", () => "<PLATFORM>"],
+  ["x-platform-version", () => "<NODE>"],
+]);
+
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
 function sanitize(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (VOLATILE_HEADERS.has(k.toLowerCase())) { out[k] = "<VOLATILE>"; continue; }
+    const key = k.toLowerCase();
+    if (VOLATILE_HEADERS.has(key)) { out[k] = "<VOLATILE>"; continue; }
+    const normalizeEnv = ENV_HEADERS.get(key);
+    if (normalizeEnv) { out[k] = typeof v === "string" ? normalizeEnv(v) : v; continue; }
     out[k] = typeof v === "string"
       ? v.replace(/Bearer .+/, "Bearer <TOK>")
           .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
