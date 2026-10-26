@@ -8,8 +8,9 @@ import {
   isOpenAICompatibleProvider,
 } from "@/shared/constants/providers";
 import { getProviderConnections, getCombos, getCustomModels, getModelAliases } from "@/lib/localDb";
+import { getApiKeyByKey } from "@/lib/db/repos/apiKeysRepo.js";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
-import { getKeyAccessContext, filterModelsListForKey } from "@/sse/services/keyAccess.js";
+import { extractClientApiKey, getKeyAccessContext, filterModelsListForKey } from "@/sse/services/keyAccess.js";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
 import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
 import { resolveQoderModels, routableQoderModels } from "open-sse/services/qoderModels.js";
@@ -708,6 +709,19 @@ export async function OPTIONS() {
  */
 export async function GET(request) {
   try {
+    // Paused keys are rejected before any catalogue work. The middleware only
+    // authenticates when requireApiKey=true, so the per-key gate must enforce
+    // isActive here too (same invariant as withApiKeyLimits on /v1 handlers).
+    const apiKey = extractClientApiKey(request);
+    if (apiKey) {
+      const record = await getApiKeyByKey(apiKey);
+      if (record && record.isActive === false) {
+        return Response.json(
+          { error: { message: "API key is paused", type: "permission_error" } },
+          { status: 403, headers: { "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+    }
     // Detect cross-instance recursive /models fetch (another 9router fetching our /models)
     const skipDynamicFetch = request?.headers?.get(INTERNAL_MODELS_FETCH_HEADER) === "1";
     const allowedProviders = await resolveModelScope(request);

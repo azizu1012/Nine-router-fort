@@ -222,6 +222,12 @@ describe("/v1/models routes filter by key", () => {
     expect(await list("sk-empty")).toEqual([]);
     expect(await list(null)).toEqual(all); // no key: unchanged (middleware governs remote access)
   });
+  it("paused key is rejected with 403", async () => {
+    fx.keys["sk-paused"] = { id: "p", name: "paused", isActive: false, access: { restricted: false, allow: [] } };
+    const res = await modelsRoute.GET(new Request("http://localhost/v1/models", { headers: auth("sk-paused") }));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.message).toMatch(/paused/i);
+  });
   it("/v1/models/{kind} and single-model lookup are filtered too", async () => {
     const kind = async (k, path) => modelsKindRoute.GET(new Request(`http://localhost/v1/models/${path.join("/")}`, { headers: auth(k) }), { params: Promise.resolve({ model: path }) });
     const emb = await (await kind("sk-open", ["embedding"])).json();
