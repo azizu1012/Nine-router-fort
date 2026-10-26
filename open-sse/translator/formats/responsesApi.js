@@ -23,6 +23,21 @@ export function normalizeResponsesInput(input) {
   return null;
 }
 
+// Strict Responses upstreams (e.g. Meta Muse) reject max_output_tokens < 16
+// with HTTP 400 ("The number must be `>= 16`"). Health-check probes often send
+// max_tokens: 1 to save quota, which maps 1:1 to max_output_tokens and trips
+// the floor. Clamp tiny-but-present values up instead of failing the probe.
+export const MIN_RESPONSES_MAX_OUTPUT_TOKENS = 16;
+
+export function clampResponsesMaxOutputTokens(body) {
+  if (!body || typeof body !== "object") return body;
+  const v = body.max_output_tokens;
+  if (typeof v === "number" && Number.isFinite(v) && v < MIN_RESPONSES_MAX_OUTPUT_TOKENS) {
+    body.max_output_tokens = MIN_RESPONSES_MAX_OUTPUT_TOKENS;
+  }
+  return body;
+}
+
 // Strict Responses upstreams reject overlong call_ids with InputValidationError (#393).
 export const MAX_RESPONSES_CALL_ID_LEN = 64;
 

@@ -13,6 +13,7 @@ import {
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
+  clampResponsesMaxOutputTokens,
 } from "../translator/formats/responsesApi.js";
 
 // OpenCode v2 UA shape: opencode/<channel>/<version>/<client>. Upstream rejects
@@ -368,6 +369,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       }
       delete body.max_tokens;
       delete body.max_completion_tokens;
+      clampResponsesMaxOutputTokens(body);
       normalizeOpencodeReasoning(model, body);
       body.stream = true;
       body.store = false;

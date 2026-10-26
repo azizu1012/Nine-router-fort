@@ -11,6 +11,7 @@ import {
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
+  clampResponsesMaxOutputTokens,
 } from "../formats/responsesApi.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 
@@ -328,6 +329,7 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     }
     delete out.max_tokens;
     delete out.max_completion_tokens;
+    clampResponsesMaxOutputTokens(out);
     return out;
   }
 
@@ -453,6 +455,7 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   } else if (body.max_tokens !== undefined) {
     result.max_output_tokens = body.max_tokens;
   }
+  clampResponsesMaxOutputTokens(result);
   if (body.top_p !== undefined) result.top_p = body.top_p;
   if (body.reasoning !== undefined) result.reasoning = body.reasoning;
   if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };

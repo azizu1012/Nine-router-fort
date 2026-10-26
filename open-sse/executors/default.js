@@ -8,6 +8,7 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { clampResponsesMaxOutputTokens } from "../translator/formats/responsesApi.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
@@ -89,6 +90,8 @@ export class DefaultExecutor extends BaseExecutor {
         delete transformed.client_metadata;
       }
       stripUnsupportedParams(this.provider, model, transformed);
+      // Safety net: strict Responses upstreams (Meta Muse) reject max_output_tokens < 16.
+      clampResponsesMaxOutputTokens(transformed);
     }
 
     return injectReasoningContent({ provider: this.provider, model, body: transformed });

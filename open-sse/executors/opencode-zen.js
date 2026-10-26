@@ -7,6 +7,7 @@ import {
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
+  clampResponsesMaxOutputTokens,
 } from "../translator/formats/responsesApi.js";
 
 const SESSION_HEADER = "x-opencode-session";
@@ -313,6 +314,7 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
     }
     delete out.max_tokens;
     delete out.max_completion_tokens;
+    clampResponsesMaxOutputTokens(out);
     if (out.reasoning_effort !== undefined && out.reasoning === undefined) {
       out.reasoning = { effort: out.reasoning_effort, summary: "auto" };
     }
