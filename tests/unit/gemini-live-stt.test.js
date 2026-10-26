@@ -442,6 +442,7 @@ describe("App-layer custom transport resolution (stt.js)", () => {
           apiKey: "AIza-TEST", connectionId: "c1", connectionName: "t", providerSpecificData: {},
         }),
         markAccountUnavailable: async () => ({ shouldFallback: false }),
+        withApiKeyLimits: async (request, innerHandler) => (typeof innerHandler === "function" ? innerHandler(request) : innerHandler),
       }));
       // getModelInfo stays REAL: "gemini/..." is a reserved-prefix passthrough,
       // so the parse→route hop in the chain is exercised, not stubbed.

@@ -48,11 +48,12 @@ describe("compressWithHeadroom openai-responses format (#1998)", () => {
     expect(typeof body.input[0].content).not.toBe("string");
   });
 
-  it("skips Responses tool/reasoning history instead of collapsing it into a message (#2132)", async () => {
+  it("compresses plain Responses tool output without collapsing protocol items (#2132, #4070)", async () => {
+    const longOutput = "tool output: file.js matches the requested symbol\n".repeat(40);
     global.fetch = vi.fn(async () => ({
       ok: true,
       json: async () => ({
-        messages: [{ role: "user", content: "compressed tool history" }],
+        messages: [{ role: "tool", tool_call_id: "headroom-tool-0", content: "compressed tool history" }],
         tokens_saved: 10,
       }),
     }));
@@ -72,7 +73,7 @@ describe("compressWithHeadroom openai-responses format (#1998)", () => {
       {
         type: "function_call_output",
         call_id: "call_apply_patch_123",
-        output: "ok",
+        output: longOutput,
       },
       {
         type: "reasoning",
@@ -99,9 +100,21 @@ describe("compressWithHeadroom openai-responses format (#1998)", () => {
       diagnostics,
     });
 
-    expect(data).toBeNull();
-    expect(global.fetch).not.toHaveBeenCalled();
-    expect(body.input).toEqual(input);
-    expect(diagnostics.reason).toBe("skipped: openai-responses tool/reasoning input is not safe to compress");
+    expect(data).not.toBeNull();
+    // Only the eligible plain-text function_call_output may be rewritten.
+    // Reasoning items, tool calls and message blocks keep their native shape.
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const sent = JSON.parse(global.fetch.mock.calls[0][1].body).messages;
+    expect(sent).toEqual([
+      { role: "tool", tool_call_id: "headroom-tool-0", content: longOutput },
+    ]);
+    expect(body.input[0]).toEqual(input[0]);
+    expect(body.input[1]).toEqual(input[1]);
+    expect(body.input[3]).toEqual(input[3]);
+    expect(body.input[2]).toMatchObject({
+      type: "function_call_output",
+      call_id: "call_apply_patch_123",
+      output: "compressed tool history",
+    });
   });
 });

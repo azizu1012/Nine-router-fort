@@ -44,7 +44,6 @@
   "clientIds": {
     "claude": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     "codex": "app_EMoamEEZ73f0CkXaXp7hrann",
-    "iflow": "10009311001",
     "kimi": "17e5f671-d194-4dfb-9706-5516cb48c098",
     "grok-cli": "b1a00492-073a-47ea-816f-4c329264a828"
   }

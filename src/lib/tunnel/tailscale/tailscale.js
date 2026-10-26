@@ -24,8 +24,15 @@ const SOCKET_FLAG = IS_WINDOWS ? [] : ["--socket", TAILSCALE_SOCKET];
 const SYSTEM_TAILSCALE_SOCKET = IS_WINDOWS ? null : "/var/run/tailscale/tailscaled.sock";
 const SYSTEM_SOCKET_FLAG = SYSTEM_TAILSCALE_SOCKET ? ["--socket", SYSTEM_TAILSCALE_SOCKET] : [];
 
-// Well-known Windows install path
-const WINDOWS_TAILSCALE_BIN = "C:\\Program Files\\Tailscale\\tailscale.exe";
+// Well-known Windows install path. Build it at runtime so Turbopack's file
+// tracer does not follow the absolute Windows path on a build host where
+// Tailscale is not installed (the tracer aborts the whole build when the
+// literal path is missing).
+const WINDOWS_TAILSCALE_BIN = path.win32.join(
+  process.env.ProgramW6432 || process.env.ProgramFiles || "C:\\Program Files",
+  "Tailscale",
+  "tailscale.exe",
+);
 
 // Common Unix install paths to probe synchronously (system tailscale)
 const UNIX_TAILSCALE_CANDIDATES = [

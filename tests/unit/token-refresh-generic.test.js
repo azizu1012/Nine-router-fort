@@ -23,9 +23,13 @@ function mockFetchOnce(payload, { ok = true, status = 200 } = {}) {
 
 describe("refreshAccessToken — config-driven profiles", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.resetModules(); global.fetch = originalFetch; });
-  afterEach(() => { global.fetch = originalFetch; });
+  afterEach(() => { global.fetch = originalFetch; vi.unstubAllEnvs(); });
 
   it("iflow: Basic Auth header from clientId:clientSecret, form body keeps client_secret", async () => {
+    // iFlow credentials are env-only in this fork; stub them before the config
+    // module is evaluated so the profile has a client to exercise.
+    vi.stubEnv("IFLOW_CLIENT_ID", "test-iflow-client");
+    vi.stubEnv("IFLOW_CLIENT_SECRET", "test-iflow-secret");
     const fm = mockFetchOnce({ access_token: "if-acc", refresh_token: "if-rot", expires_in: 3600 });
     const { refreshAccessToken } = await import("open-sse/services/tokenRefresh/providers.js");
 
