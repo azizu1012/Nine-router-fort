@@ -32,6 +32,15 @@ export const UPDATER_CONFIG = {
   appPort: 20128,
 };
 
+// This fork still wants the upstream "new version available" notice, but the
+// public npm updater would overwrite fork-only security code. Keep the check,
+// hide the destructive install flow, and point the operator at the port guide.
+export const SELF_MANAGED_UPDATE = {
+  enabled: true,
+  notePath: "D:\\AI_Projects\\router_api\\scripts\\HOW_TO_UPDATE_ORIGIN_FROM_UPSTREAM.md",
+  rebuildCmd: "D:\\AI_Projects\\router_api\\scripts\\start_9router.bat rebuild",
+};
+
 // Theme configuration
 export const THEME_CONFIG = {
   storageKey: "theme",

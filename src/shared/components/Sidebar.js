@@ -5,7 +5,7 @@ import PropTypes from "prop-types";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/shared/utils/cn";
-import { APP_CONFIG, UPDATER_CONFIG } from "@/shared/constants/config";
+import { APP_CONFIG, UPDATER_CONFIG, SELF_MANAGED_UPDATE } from "@/shared/constants/config";
 import { MEDIA_PROVIDER_KINDS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import useSettingsStore from "@/store/settingsStore";
@@ -50,7 +50,9 @@ export default function Sidebar({ onClose }) {
   const [enableTranslator, setEnableTranslator] = useState(false);
   const { copied, copy } = useCopyToClipboard(2000);
 
-  const INSTALL_CMD = UPDATER_CONFIG.installCmdLatest;
+  const INSTALL_CMD = SELF_MANAGED_UPDATE.enabled
+    ? SELF_MANAGED_UPDATE.rebuildCmd
+    : UPDATER_CONFIG.installCmdLatest;
 
   useEffect(() => {
     useSettingsStore.getState().fetchSettings().then((data) => {
@@ -82,8 +84,14 @@ export default function Sidebar({ onClose }) {
     setIsUpdating(true);
   };
 
-  // Triggered by Copy button inside ManualUpdatePanel: copy + countdown + shutdown
+  // Fork-safe update flow: copy the rebuild command instead of shutting the
+  // server down for the public npm updater (which would overwrite fork code).
   const handleCopyAndShutdown = async () => {
+    if (SELF_MANAGED_UPDATE.enabled) {
+      try { await navigator.clipboard.writeText(INSTALL_CMD); } catch { /* clipboard blocked */ }
+      copy(INSTALL_CMD);
+      return;
+    }
     try { await navigator.clipboard.writeText(INSTALL_CMD); } catch { /* clipboard blocked */ }
     copy(INSTALL_CMD);
     let remaining = UPDATER_CONFIG.shutdownCountdownSec;
@@ -134,18 +142,18 @@ export default function Sidebar({ onClose }) {
           {updateInfo && (
             <div className="flex flex-col gap-1.5 rounded p-1 -m-1">
               <span className="text-xs font-semibold text-green-600 dark:text-amber-500">
-                ↑ New version available: v{updateInfo.latestVersion}
+                ↑ {SELF_MANAGED_UPDATE.enabled ? "Upstream" : "New version"} available: v{updateInfo.latestVersion}
               </span>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setShowUpdateModal(true)}
                   className="px-2 py-1 rounded bg-green-600 hover:bg-green-700 dark:bg-amber-500 dark:hover:bg-amber-600 text-white text-[11px] font-semibold transition-colors cursor-pointer"
                 >
-                  Update now
+                  {SELF_MANAGED_UPDATE.enabled ? "How to update" : "Update now"}
                 </button>
                 <button
                   onClick={() => copy(INSTALL_CMD)}
-                  title="Copy install command"
+                  title={SELF_MANAGED_UPDATE.enabled ? "Copy rebuild command" : "Copy install command"}
                   className="flex-1 text-left hover:opacity-80 transition-opacity cursor-pointer min-w-0"
                 >
                   <code className="block text-[10px] text-green-600/80 dark:text-amber-400/70 font-mono truncate">
@@ -361,9 +369,11 @@ export default function Sidebar({ onClose }) {
         isOpen={showUpdateModal}
         onClose={() => setShowUpdateModal(false)}
         onConfirm={handleUpdate}
-        title="Update 9Router"
-        message={`Show install command for v${updateInfo?.latestVersion || ""}? You can copy it and shutdown to install manually.`}
-        confirmText="Show Command"
+        title={SELF_MANAGED_UPDATE.enabled ? "Update fork from upstream" : "Update 9Router"}
+        message={SELF_MANAGED_UPDATE.enabled
+          ? `Upstream v${updateInfo?.latestVersion || ""} is available. This fork ports upstream manually, then rebuilds. Show the guide?`
+          : `Show install command for v${updateInfo?.latestVersion || ""}? You can copy it and shutdown to install manually.`}
+        confirmText={SELF_MANAGED_UPDATE.enabled ? "Show Guide" : "Show Command"}
         cancelText="Cancel"
         variant="primary"
       />
@@ -380,6 +390,8 @@ export default function Sidebar({ onClose }) {
               onCancel={handleCancelUpdate}
               countdown={shutdownCountdown}
               isDisconnected={isDisconnected}
+              selfManaged={SELF_MANAGED_UPDATE.enabled}
+              notePath={SELF_MANAGED_UPDATE.notePath}
             />
           ) : (
             <div className="text-center p-8">
@@ -403,8 +415,50 @@ Sidebar.propTypes = {
   onClose: PropTypes.func,
 };
 
-function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdown, onCancel, countdown, isDisconnected }) {
+function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdown, onCancel, countdown, isDisconnected, selfManaged, notePath }) {
   const isCountingDown = countdown > 0;
+
+  if (selfManaged) {
+    return (
+      <div className="w-full max-w-lg rounded-xl bg-neutral-900/95 border border-white/10 p-6 text-white">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="flex items-center justify-center size-11 rounded-full bg-amber-500/20 text-amber-400">
+            <span className="material-symbols-outlined text-[24px]">upgrade</span>
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">Update fork to upstream{latestVersion ? ` v${latestVersion}` : ""}</h2>
+            <p className="text-xs text-white/60">
+              The public npm updater is disabled to protect fork-only changes.
+            </p>
+          </div>
+        </div>
+
+        <p className="text-sm text-white/80 mb-2">Maintenance note:</p>
+        <div className="w-full px-3 py-2 rounded bg-white/5 mb-4">
+          <code className="text-xs font-mono text-amber-400 break-all">{notePath}</code>
+        </div>
+
+        <ol className="text-xs text-white/70 space-y-1 list-decimal list-inside mb-4">
+          <li>Open the note and port the upstream commits, keeping the fork custom blocks.</li>
+          <li>Run the tests and baseline checks listed in the note.</li>
+          <li>Run the rebuild command below (the server restarts briefly).</li>
+        </ol>
+
+        <p className="text-sm text-white/80 mb-2">Rebuild command:</p>
+        <div className="w-full px-3 py-2 rounded bg-white/5 mb-4">
+          <code className="text-xs font-mono text-green-400 break-all">{installCmd}</code>
+        </div>
+
+        <div className="flex gap-2">
+          <Button variant="secondary" onClick={onCancel}>Close</Button>
+          <Button variant="primary" fullWidth onClick={onCopyAndShutdown}>
+            {copied ? "✓ Copied" : "Copy rebuild command"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="w-full max-w-lg rounded-xl bg-neutral-900/95 border border-white/10 p-6 text-white">
       <div className="flex items-center gap-3 mb-4">
@@ -460,4 +514,6 @@ ManualUpdatePanel.propTypes = {
   onCancel: PropTypes.func.isRequired,
   countdown: PropTypes.number,
   isDisconnected: PropTypes.bool,
+  selfManaged: PropTypes.bool,
+  notePath: PropTypes.string,
 };
