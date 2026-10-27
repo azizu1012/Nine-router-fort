@@ -8,8 +8,10 @@ import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
-import { clampResponsesMaxOutputTokens } from "../translator/formats/responsesApi.js";
+import { clampResponsesMaxOutputTokens, ensureReasoningEncryptedContentInclude } from "../translator/formats/responsesApi.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+import { MUSE_PROVIDER_ID } from "../config/providerIds.js";
+import { createMuseContinuationStream, shouldContinueMuseResponse } from "../services/museContinuation.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -92,9 +94,56 @@ export class DefaultExecutor extends BaseExecutor {
       stripUnsupportedParams(this.provider, model, transformed);
       // Safety net: strict Responses upstreams (Meta Muse) reject max_output_tokens < 16.
       clampResponsesMaxOutputTokens(transformed);
+      // Muse is store=false: encrypted reasoning is the only chain-of-thought
+      // continuity across turns. Meta forbids combining `include` with
+      // previous_response_id, so only request it on the stateless path.
+      if (this.provider === MUSE_PROVIDER_ID && !transformed.previous_response_id) {
+        ensureReasoningEncryptedContentInclude(transformed);
+      }
     }
 
     return injectReasoningContent({ provider: this.provider, model, body: transformed });
+  }
+
+  // Muse announce-then-stop recovery. The translator already asks the model to
+  // act in the same turn, but when it still ends on "I'll now ..." the router
+  // replays the turn and nudges once, in the same client stream. Scoped to the
+  // direct provider and translated clients; fail-open (see museContinuation.js).
+  async execute(args = {}) {
+    const result = await super.execute(args);
+    if (!shouldContinueMuseResponse({ provider: this.provider, args, result })) return result;
+
+    const original = result.response;
+    const headers = new Headers(original.headers);
+    // The wrapped body is a different length (and may be longer than the first
+    // response); never forward the original content-length.
+    headers.delete("content-length");
+
+    const continuation = createMuseContinuationStream({
+      body: result.transformedBody,
+      signal: args.signal,
+      log: args.log,
+      retry: async (continuationBody) => {
+        const retryResult = await BaseExecutor.prototype.execute.call(this, {
+          ...args,
+          body: continuationBody,
+        });
+        if (!retryResult.response.ok) {
+          const detail = await retryResult.response.text().catch(() => "");
+          throw new Error(`continuation HTTP ${retryResult.response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+        }
+        return retryResult.response;
+      },
+    });
+
+    return {
+      ...result,
+      response: new Response(original.body.pipeThrough(continuation), {
+        status: original.status,
+        statusText: original.statusText,
+        headers,
+      }),
+    };
   }
 
   applyNousAttribution(model, body, stream, credentials) {

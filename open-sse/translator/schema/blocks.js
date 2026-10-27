@@ -46,6 +46,14 @@ export const RESPONSES_ITEM = {
   SUMMARY_TEXT: "summary_text",
 };
 
+// Responses API assistant-message phases. `commentary` marks text the model
+// wrote on the way to a tool call (as opposed to its final answer). Meta's
+// Responses API requires it on replay: an assistant message that precedes a
+// function_call without the phase is rejected with HTTP 400.
+export const RESPONSES_MESSAGE_PHASE = {
+  COMMENTARY: "commentary",
+};
+
 // Valid OpenAI block types (used by filterToOpenAIFormat).
 export const VALID_OPENAI_CONTENT_TYPES = [
   OPENAI_BLOCK.TEXT, OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE,

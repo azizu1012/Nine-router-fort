@@ -38,6 +38,23 @@ export function clampResponsesMaxOutputTokens(body) {
   return body;
 }
 
+// Responses `include` values. `reasoning.encrypted_content` is what lets a
+// store=false session replay its chain of thought on the next turn; Meta's
+// docs recommend it as the stateless continuity path.
+export const RESPONSES_INCLUDE = {
+  REASONING_ENCRYPTED_CONTENT: "reasoning.encrypted_content",
+};
+
+export function ensureReasoningEncryptedContentInclude(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.input)) return body;
+  const include = Array.isArray(body.include) ? body.include : [];
+  if (!include.includes(RESPONSES_INCLUDE.REASONING_ENCRYPTED_CONTENT)) {
+    include.push(RESPONSES_INCLUDE.REASONING_ENCRYPTED_CONTENT);
+  }
+  body.include = include;
+  return body;
+}
+
 // Strict Responses upstreams reject overlong call_ids with InputValidationError (#393).
 export const MAX_RESPONSES_CALL_ID_LEN = 64;
 

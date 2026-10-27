@@ -44,6 +44,18 @@ function envUrl(name, def) {
   return raw || def;
 }
 
+// Server-side cache for Muse (Meta) reasoning continuity. Muse models are
+// Responses-only and store=false: the encrypted reasoning blob is the only way
+// to carry a chain of thought into the next turn. Chat/Claude clients never see
+// that blob, so the router remembers it per conversation and replays it.
+export const MUSE_REASONING_CACHE = {
+  ttlMs: envMs("MUSE_REASONING_TTL_MS", MEMORY_CONFIG.sessionTtlMs),
+  maxSessions: 256,
+  maxTurnsPerSession: 80,
+  maxEntriesPerFingerprint: 8,
+  maxBytes: 64 * 1024 * 1024,
+};
+
 // SearXNG endpoint used by the unauthenticated web-search provider.
 // Configure this for a separate Docker service or remote SearXNG instance.
 export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search");

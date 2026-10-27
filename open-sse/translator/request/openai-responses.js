@@ -13,7 +13,10 @@ import {
   coerceResponsesOutput,
   clampResponsesMaxOutputTokens,
 } from "../formats/responsesApi.js";
-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, RESPONSES_MESSAGE_PHASE } from "../schema/index.js";
+import { MUSE_PROVIDER_ID } from "../../config/providerIds.js";
+import { normalizeMuseResponsesRequest } from "../concerns/muse.js";
+import { buildMuseTurnFingerprint, recallMuseReasoning } from "../../services/museReasoningCache.js";
 
 const MAX_TOOL_NAME_LEN = 128;
 
@@ -307,10 +310,15 @@ function buildReasoningInputItem(msg) {
 
   if (!encrypted && !summaryText) return null;
 
-  const item = { type: RESPONSES_ITEM.REASONING };
-  if (summaryText) {
-    item.summary = [{ type: RESPONSES_ITEM.SUMMARY_TEXT, text: summaryText }];
-  }
+  // Meta's Responses API requires `summary` on every replayed reasoning item;
+  // omitting it when only encrypted_content survives returns HTTP 400. Send an
+  // empty array rather than dropping the field.
+  const item = {
+    type: RESPONSES_ITEM.REASONING,
+    summary: summaryText
+      ? [{ type: RESPONSES_ITEM.SUMMARY_TEXT, text: summaryText }]
+      : [],
+  };
   // encrypted_content is the continuity token for store=false backends
   if (encrypted) item.encrypted_content = encrypted;
   return item;
@@ -319,7 +327,7 @@ function buildReasoningInputItem(msg) {
 /**
  * Convert OpenAI Chat Completions to OpenAI Responses API format
  */
-export function openaiToOpenAIResponsesRequest(model, body, stream, credentials) {
+export function openaiToOpenAIResponsesRequest(model, body, stream, credentials, provider) {
   // Body already in Responses API format (e.g. Cursor CLI calling /chat/completions with input[])
   if (body.input) {
     const out = { ...body, model, stream: true };
@@ -330,6 +338,7 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     delete out.max_tokens;
     delete out.max_completion_tokens;
     clampResponsesMaxOutputTokens(out);
+    normalizeMuseResponsesRequest(out, provider);
     return out;
   }
 
@@ -343,6 +352,12 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   // Extract system message as instructions
   let hasSystemMessage = false;
   const messages = body.messages || [];
+
+  // Cached Muse reasoning is matched per assistant turn. Repeated identical
+  // turns (same text + same tool calls) get their own entry, so keep a cursor
+  // per fingerprint for the duration of this translation.
+  const museSessionId = credentials?._museReasoningSession || null;
+  const museFingerprintOccurrences = new Map();
 
   for (const msg of messages) {
     if (msg.role === ROLE.SYSTEM || msg.role === ROLE.DEVELOPER) {
@@ -361,8 +376,33 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       // re-emit a reasoning item before the assistant message when the chat-format
       // history carried reasoning text and/or encrypted_content from a prior turn.
       if (msg.role === ROLE.ASSISTANT) {
-        const reasoningItem = buildReasoningInputItem(msg);
-        if (reasoningItem) result.input.push(reasoningItem);
+        const clientReasoning = buildReasoningInputItem(msg);
+        let cachedReasoning = null;
+
+        // Chat/Claude clients cannot echo Meta's encrypted reasoning blob. When
+        // the client did not supply one, replay what the router captured for
+        // this exact turn (session + model scoped).
+        if (
+          provider === MUSE_PROVIDER_ID &&
+          museSessionId &&
+          !clientReasoning?.encrypted_content
+        ) {
+          const turnFingerprint = buildMuseTurnFingerprint(msg);
+          if (turnFingerprint) {
+            const occurrence = museFingerprintOccurrences.get(turnFingerprint) || 0;
+            museFingerprintOccurrences.set(turnFingerprint, occurrence + 1);
+            cachedReasoning = recallMuseReasoning({
+              provider,
+              model,
+              sessionId: museSessionId,
+              fingerprint: turnFingerprint,
+              occurrence,
+            });
+          }
+        }
+
+        if (cachedReasoning?.length) result.input.push(...cachedReasoning);
+        else if (clientReasoning) result.input.push(clientReasoning);
       }
 
       const contentType = msg.role === ROLE.USER ? RESPONSES_ITEM.INPUT_TEXT : RESPONSES_ITEM.OUTPUT_TEXT;
@@ -389,11 +429,22 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       // Assistant messages with only tool_calls have content: null — skip the
       // message block in that case; the tool_calls are pushed separately below.
       if (content.length > 0) {
-        result.input.push({
+        const messageItem = {
           type: RESPONSES_ITEM.MESSAGE,
           role: msg.role,
           content
-        });
+        };
+        // Meta rejects a replayed assistant turn whose text precedes a
+        // function_call unless it is marked as commentary (HTTP 400).
+        if (
+          provider === MUSE_PROVIDER_ID &&
+          msg.role === ROLE.ASSISTANT &&
+          Array.isArray(msg.tool_calls) &&
+          msg.tool_calls.length > 0
+        ) {
+          messageItem.phase = RESPONSES_MESSAGE_PHASE.COMMENTARY;
+        }
+        result.input.push(messageItem);
       }
     }
 
@@ -461,6 +512,12 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
   if (body.service_tier !== undefined) result.service_tier = body.service_tier;
   if (body.prompt_cache_key !== undefined) result.prompt_cache_key = body.prompt_cache_key;
+
+  // Tool selection is part of the Responses schema and was previously dropped,
+  // which silently widened "none" and forced-function requests to auto.
+  if (body.tool_choice !== undefined) result.tool_choice = body.tool_choice;
+  if (body.parallel_tool_calls !== undefined) result.parallel_tool_calls = body.parallel_tool_calls;
+  normalizeMuseResponsesRequest(result, provider);
 
   return result;
 }

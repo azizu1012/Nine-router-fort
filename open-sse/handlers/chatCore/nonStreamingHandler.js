@@ -13,7 +13,8 @@ import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { detectClientTool } from "../../utils/clientDetector.js";
 import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
-import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { ROLE, RESPONSES_ITEM, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "../../translator/schema/index.js";
+import { rememberMuseReasoning } from "../../services/museReasoningCache.js";
 
 /**
  * Convert an OpenAI Chat Completions non-streaming response body into the
@@ -231,7 +232,16 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
       if (toolCalls.length > 0) message.tool_calls = toolCalls;
       if (!message.content && !message.tool_calls) message.content = "";
 
-      let finishReason = responseBody.status === "completed" ? (toolCalls.length > 0 ? "tool_calls" : "stop") : (responseBody.status || "stop");
+      // `incomplete` is a real terminal status, not a successful stop. Chat
+      // clients only understand OpenAI finish reasons, so map it to
+      // `length` / `content_filter` (tool calls still win — the turn acted).
+      let finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
+      if (responseBody.status === RESPONSES_STATUS.INCOMPLETE) {
+        finishReason = responseBody.incomplete_details?.reason === RESPONSES_INCOMPLETE_REASON.CONTENT_FILTER
+          ? "content_filter"
+          : "length";
+        if (toolCalls.length > 0) finishReason = "tool_calls";
+      }
 
       const result = {
         id: `chatcmpl-${responseBody.id || Date.now()}`.replace(/^chatcmpl-resp_/, "chatcmpl-"),
@@ -268,7 +278,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, credentials = null, trackDone, appendLog, pxpipe, reqTag, log }) {
   trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
@@ -307,6 +317,17 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   // Decloak tool_use names once on raw Claude body, before any translation (INPUT side)
   responseBody = decloakToolNames(responseBody, toolNameMap);
+
+  // Keep Meta's encrypted reasoning before it is dropped by the Chat/Claude
+  // translation, so the next turn can replay it.
+  if (targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat !== FORMATS.OPENAI_RESPONSES) {
+    rememberMuseReasoning({
+      provider,
+      model,
+      sessionId: credentials?._museReasoningSession,
+      output: responseBody?.output,
+    });
+  }
 
   const usage = extractUsageFromResponse(responseBody);
   appendLog({ tokens: usage, status: "200 OK" });

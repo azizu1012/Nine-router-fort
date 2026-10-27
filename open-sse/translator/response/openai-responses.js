@@ -8,7 +8,8 @@ import { buildChunk } from "../concerns/chunk.js";
 import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
-import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK, RESPONSES_STATUS, RESPONSES_INCOMPLETE_REASON } from "../schema/index.js";
+import { rememberMuseReasoning } from "../../services/museReasoningCache.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
@@ -498,9 +499,57 @@ function flushEvents(state) {
 // currentToolCallId is intentionally sticky for the current turn so flush/completion
   // can still finalize as tool_calls even if the tool call was emitted before stream end.
 function computeFinishReason(state) {
-   return state.toolCallIndex > 0 || state.currentToolCallId
-    ? OPENAI_FINISH.TOOL_CALLS
-    : OPENAI_FINISH.STOP;
+  // A turn that produced tool calls is complete enough to act on, even when the
+  // upstream also reports a truncation reason.
+  if (state.toolCallIndex > 0 || state.currentToolCallId) return OPENAI_FINISH.TOOL_CALLS;
+
+  // `response.incomplete` is a terminal event, not a successful stop. Map it so
+  // clients (and the empty-content failover) see a truncated turn instead of a
+  // normal end_turn. Unknown reasons stay conservative: truncated.
+  if (state.incompleteReason) {
+    return state.incompleteReason === RESPONSES_INCOMPLETE_REASON.CONTENT_FILTER
+      ? OPENAI_FINISH.CONTENT_FILTER
+      : OPENAI_FINISH.LENGTH;
+  }
+  return OPENAI_FINISH.STOP;
+}
+
+function applyTerminalResponse(state, response) {
+  if (response?.usage && typeof response.usage === "object") {
+    const inputTokens = response.usage.input_tokens || response.usage.prompt_tokens || 0;
+    const outputTokens = response.usage.output_tokens || response.usage.completion_tokens || 0;
+    // OpenAI Responses API: input_tokens already includes cached_tokens
+    // Cache info is in input_tokens_details.cached_tokens
+    const cacheReadTokens = response.usage.input_tokens_details?.cached_tokens || response.usage.cache_read_input_tokens || 0;
+    state.usage = buildUsage({ promptTokens: inputTokens, completionTokens: outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cacheReadTokens });
+  }
+
+  // Some upstreams send `response.completed` with status "incomplete" instead
+  // of the dedicated event; both must land on the truncated path.
+  if (response?.status === RESPONSES_STATUS.INCOMPLETE) {
+    state.incompleteReason = response.incomplete_details?.reason || "unknown";
+  }
+}
+
+// Meta returns encrypted reasoning only when asked; store it so a Chat/Claude
+// client's next turn can replay the chain of thought. Native Responses clients
+// already echo the blob themselves, so skip them.
+function captureTerminalMuseReasoning(state, response) {
+  if (state.museReasoningCaptured) return;
+  state.museReasoningCaptured = true;
+  if (state.sourceFormat === FORMATS.OPENAI_RESPONSES) return;
+
+  const output = Array.isArray(response?.output) && response.output.length > 0
+    ? response.output
+    : collectCompletedOutputItems(state);
+
+  rememberMuseReasoning({
+    provider: state.provider,
+    model: state.model,
+    sessionId: state.sessionId,
+    output,
+    reasoningItems: state.museReasoningItems,
+  });
 }
 
 /**
@@ -566,6 +615,22 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
+  // Reasoning item completion carries the encrypted continuity blob. Keep it
+  // for the terminal capture: not every upstream repeats `output` on the
+  // terminal event.
+  if (eventType === "response.output_item.done" && data.item?.type === RESPONSES_ITEM.REASONING) {
+    (state.museReasoningItems ??= []).push(data.item);
+    recordCompletedOutputItem(state, data.output_index, data.item);
+    return null;
+  }
+
+  // Completed assistant message (text is streamed via deltas, but the terminal
+  // item is what carries the full text for fingerprinting/cache capture).
+  if (eventType === "response.output_item.done" && data.item?.type === RESPONSES_ITEM.MESSAGE) {
+    recordCompletedOutputItem(state, data.output_index, data.item);
+    return null;
+  }
+
   // Function call started (standard function_call or custom_tool_call).
   // Index is assigned here (not on done): attributing deltas by stream position
   // merges parallel calls into index 0 whenever upstream emits all addeds
@@ -619,6 +684,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const key = data.item?.id || data.item_id;
     const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
+    recordCompletedOutputItem(state, data.output_index, data.item);
     const fullArgs = data.item?.arguments;
     if (typeof fullArgs === "string" && fullArgs) {
       state.respToolArgsEmitted ??= new Set();
@@ -633,20 +699,19 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
-  // Response completed
-  if (eventType === "response.completed" || eventType === "response.done") {
-    // Extract usage from response.completed event
-    const responseUsage = data.response?.usage;
-    if (responseUsage && typeof responseUsage === "object") {
-      const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;
-      const outputTokens = responseUsage.output_tokens || responseUsage.completion_tokens || 0;
-      // OpenAI Responses API: input_tokens already includes cached_tokens
-      // Cache info is in input_tokens_details.cached_tokens
-      const cacheReadTokens = responseUsage.input_tokens_details?.cached_tokens || responseUsage.cache_read_input_tokens || 0;
-      
-      state.usage = buildUsage({ promptTokens: inputTokens, completionTokens: outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cacheReadTokens });
+  // Response completed / incomplete / done — all terminal, but only the first
+  // two can carry the truncation signal we need to surface.
+  if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
+    const response = data.response || {};
+    applyTerminalResponse(state, response);
+    captureTerminalMuseReasoning(state, response);
+
+    // `response.incomplete` is Meta's dedicated truncation event. Its reason
+    // lives on response.incomplete_details, not on the event wrapper.
+    if (eventType === "response.incomplete") {
+      state.incompleteReason = response.incomplete_details?.reason || "unknown";
     }
-    
+
     if (!state.finishReasonSent) {
       const finishReason = computeFinishReason(state);
 

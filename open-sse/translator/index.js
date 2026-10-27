@@ -7,6 +7,9 @@ import { filterToOpenAIFormat } from "./formats/openai.js";
 import { normalizeThinkingConfig } from "../services/provider.js";
 import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
 import { captureSessionId } from "../utils/sessionManager.js";
+import { resolveMuseReasoningSession } from "../services/museReasoningCache.js";
+import { MUSE_PROVIDER_ID } from "../config/providerIds.js";
+import { normalizeMuseResponsesRequest } from "./concerns/muse.js";
 import { ensureStreamToolCallIds } from "../utils/streamHelpers.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
@@ -98,6 +101,16 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // Expose to downstream translators (gemini-cli/antigravity envelopes) that run after envelope is stripped
   if (credentials) credentials._clientSessionId = clientSessionId;
 
+  // Muse reasoning continuity is keyed to a conversation, not just a connection:
+  // two chats on the same API key must not share encrypted chain-of-thought.
+  if (credentials && provider === MUSE_PROVIDER_ID && targetFormat === FORMATS.OPENAI_RESPONSES) {
+    credentials._museReasoningSession = resolveMuseReasoningSession({ baseSessionId: clientSessionId, body: result });
+    // Native Responses clients own their turn loop; only translated clients
+    // (Chat Completions / Claude Code) need the router to recover a stalled
+    // announce-only Muse turn.
+    credentials._museContinuationEligible = sourceFormat !== FORMATS.OPENAI_RESPONSES;
+  }
+
   // If same format, skip translation steps
   if (sourceFormat !== targetFormat) {
     // Direct route: if a translator is registered for this exact source:target
@@ -105,13 +118,13 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     // pairs like claude:kiro (avoids the claude->openai->kiro double-hop).
     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
     if (directFn) {
-      result = directFn(model, result, stream, credentials);
+      result = directFn(model, result, stream, credentials, provider);
     } else {
       // Step 1: source -> openai (if source is not openai)
       if (sourceFormat !== FORMATS.OPENAI) {
         const toOpenAI = requestRegistry.get(`${sourceFormat}:${FORMATS.OPENAI}`);
         if (toOpenAI) {
-          result = toOpenAI(model, result, stream, credentials);
+          result = toOpenAI(model, result, stream, credentials, provider);
           // Log OpenAI intermediate format
           reqLogger?.logOpenAIRequest?.(result);
         }
@@ -121,10 +134,17 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       if (targetFormat !== FORMATS.OPENAI) {
         const fromOpenAI = requestRegistry.get(`${FORMATS.OPENAI}:${targetFormat}`);
         if (fromOpenAI) {
-          result = fromOpenAI(model, result, stream, credentials);
+          result = fromOpenAI(model, result, stream, credentials, provider);
         }
       }
     }
+  }
+
+  // Native Responses clients (source === target) skip the translator chain, so
+  // Muse's strict request rules must run here too. Idempotent for translated
+  // bodies that already carry the normalized tool_choice and directive.
+  if (targetFormat === FORMATS.OPENAI_RESPONSES) {
+    result = normalizeMuseResponsesRequest(result, provider);
   }
 
   // Normalize thinking to the target provider-native format (config-driven, capability-aware).
