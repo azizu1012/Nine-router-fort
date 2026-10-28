@@ -25,6 +25,8 @@ const ALIAS_TOKENS = [
   "dv","devin","devin-cli","morph","morphllm",
   "muse","muse-ai","meta-model-api",
   "muse-code","muse-subscription",
+  "nace","drex",
+  "runcrate","sensenova","ollama-local",
   "br","bedrock","aws-bedrock",
   "brx","bedrock-xai","bedrock-grok",
   "nous","nous-portal","nous-research","ns",
