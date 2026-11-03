@@ -200,14 +200,23 @@ function inferKindFromUnknownModelId(modelId) {
   return LLM_KIND;
 }
 
-async function fetchCompatibleModelIds(connection) {
-  if (!connection?.apiKey) return [];
+const COMPATIBLE_MODELS_CACHE_TTL_MS = 60000;
+const compatibleModelsCache = new Map();
+
+async function fetchCompatibleModels(connection) {
+  if (!connection?.apiKey) return { modelIds: [], capabilitiesById: new Map() };
 
   const baseUrl = typeof connection?.providerSpecificData?.baseUrl === "string"
     ? connection.providerSpecificData.baseUrl.trim().replace(/\/$/, "")
     : "";
 
-  if (!baseUrl) return [];
+  if (!baseUrl) return { modelIds: [], capabilitiesById: new Map() };
+
+  const cacheKey = `${connection.provider}:${baseUrl}:${connection.apiKey}`;
+  const cached = compatibleModelsCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < COMPATIBLE_MODELS_CACHE_TTL_MS) {
+    return cached.result;
+  }
 
   let url = `${baseUrl}/models`;
   const headers = {
@@ -226,7 +235,7 @@ async function fetchCompatibleModelIds(connection) {
     headers["anthropic-version"] = "2023-06-01";
     headers.Authorization = `Bearer ${connection.apiKey}`;
   } else {
-    return [];
+    return { modelIds: [], capabilitiesById: new Map() };
   }
 
   try {
@@ -240,21 +249,46 @@ async function fetchCompatibleModelIds(connection) {
     });
     clearTimeout(timeoutId);
 
-    if (!response.ok) return [];
+    if (!response.ok) return { modelIds: [], capabilitiesById: new Map() };
 
     const data = await response.json();
     const rawModels = parseOpenAIStyleModels(data);
+    const capabilitiesById = new Map();
+    const modelIds = [];
 
-    return Array.from(
-      new Set(
-        rawModels
-          .map((model) => model?.id || model?.name || model?.model)
-          .filter((modelId) => typeof modelId === "string" && modelId.trim() !== "")
-      )
-    );
+    for (const model of rawModels) {
+      const modelId = model?.id || model?.name || model?.model;
+      if (typeof modelId !== "string" || !modelId.trim()) continue;
+      const cleanId = modelId.trim();
+      modelIds.push(cleanId);
+
+      const ctx = model.context_length || model.max_input_tokens || model.contextWindow || model.capabilities?.contextWindow;
+      const maxOut = model.max_tokens || model.max_completion_tokens || model.maxOutput || model.capabilities?.maxOutput;
+      const caps = {};
+      if (Number.isFinite(ctx) && ctx > 0) caps.contextWindow = ctx;
+      if (Number.isFinite(maxOut) && maxOut > 0) caps.maxOutput = maxOut;
+      if (model.capabilities && typeof model.capabilities === "object") {
+        Object.assign(caps, model.capabilities);
+      }
+      if (Object.keys(caps).length > 0) {
+        capabilitiesById.set(cleanId, caps);
+      }
+    }
+
+    const result = {
+      modelIds: Array.from(new Set(modelIds)),
+      capabilitiesById,
+    };
+    compatibleModelsCache.set(cacheKey, { timestamp: Date.now(), result });
+    return result;
   } catch {
-    return [];
+    return { modelIds: [], capabilitiesById: new Map() };
   }
+}
+
+async function fetchCompatibleModelIds(connection) {
+  const res = await fetchCompatibleModels(connection);
+  return res.modelIds;
 }
 
 // Provider matches kindFilter when its serviceKinds intersect the requested kinds.
@@ -341,9 +375,9 @@ export async function buildModelsList(kindFilter, options = {}) {
   // When this header is present, the /v1/models request came from another
   // 9router instance's fetchCompatibleModelIds — skip dynamic fetch to break
   // cross-instance recursive loops.
-  const skipDynamicFetch = options.skipDynamicFetch === true;
+  const skipDynamicFetch = options?.skipDynamicFetch === true;
   // Per-API-key provider allow-list (null = unrestricted).
-  const allowedProviders = options.allowedProviders || null;
+  const allowedProviders = options?.allowedProviders || null;
   let connections = [];
   try {
     connections = await getProviderConnections();
@@ -524,8 +558,16 @@ export async function buildModelsList(kindFilter, options = {}) {
           )
         : providerModels.map((model) => model.id);
 
-      if (isCompatibleProvider && rawModelIds.length === 0 && !skipDynamicFetch) {
-        rawModelIds = await fetchCompatibleModelIds(conn);
+      if (isCompatibleProvider && !skipDynamicFetch) {
+        const liveCompat = await fetchCompatibleModels(conn);
+        if (rawModelIds.length === 0 && liveCompat.modelIds.length > 0) {
+          rawModelIds = liveCompat.modelIds;
+        }
+        if (liveCompat.capabilitiesById.size > 0) {
+          for (const [mid, caps] of liveCompat.capabilitiesById.entries()) {
+            liveCapabilitiesById.set(mid, caps);
+          }
+        }
       }
 
       // Config-driven live catalog override (e.g. Kiro returns dynamic
@@ -569,6 +611,7 @@ export async function buildModelsList(kindFilter, options = {}) {
         .filter((modelId) => typeof modelId === "string" && modelId.trim() !== "");
 
       const customModelKindById = new Map();
+      const customModelCapsById = new Map();
       const customModelIds = customModels
         .filter((m) => {
           if (!m?.id) return false;
@@ -581,7 +624,12 @@ export async function buildModelsList(kindFilter, options = {}) {
         })
         .map((m) => {
           const modelId = String(m.id).trim();
-          if (modelId) customModelKindById.set(modelId, getModelKind(m) || LLM_KIND);
+          if (modelId) {
+            customModelKindById.set(modelId, getModelKind(m) || LLM_KIND);
+            if (m.caps && typeof m.caps === "object") {
+              customModelCapsById.set(modelId, m.caps);
+            }
+          }
           return modelId;
         })
         .filter((modelId) => modelId !== "");
@@ -630,10 +678,17 @@ export async function buildModelsList(kindFilter, options = {}) {
         // { id, name } — no per-model capability data. Fall back to the same
         // pattern-matched capabilities the dashboard uses (useModelCaps.js) so
         // dynamically-discovered LLM models still surface vision/reasoning/search/tools.
+        const baseCaps = kind === LLM_KIND ? getCapabilitiesForModel(providerId, modelId) : null;
         const liveCaps = liveCapabilitiesById.get(modelId);
+        const customCaps = customModelCapsById.get(modelId);
         const serviceCaps = capabilitiesFromServiceKind(customKind || liveKind);
-        const caps = liveCaps || serviceCaps || (kind === LLM_KIND ? getCapabilitiesForModel(providerId, modelId) : null);
-        if (caps) model.capabilities = caps;
+        const caps = {
+          ...(baseCaps || {}),
+          ...(serviceCaps || {}),
+          ...(liveCaps || {}),
+          ...(customCaps || {}),
+        };
+        if (Object.keys(caps).length > 0) model.capabilities = caps;
         // Token limits under the snake_case names the OpenAI/OpenRouter
         // convention uses. `capabilities.contextWindow` is camelCase and nested,
         // so clients matching context_length find nothing, fall back to guessing

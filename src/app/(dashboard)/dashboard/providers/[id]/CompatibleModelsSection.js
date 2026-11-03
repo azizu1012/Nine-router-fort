@@ -145,7 +145,13 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
         const modelId = model.id || model.name || model.model;
         if (!modelId) continue;
         if (allModels.some((entry) => entry.id === modelId)) continue;
-        await onAddCustomModel(modelId);
+        const ctx = model.context_length || model.max_input_tokens || model.contextWindow || model.capabilities?.contextWindow;
+        const maxOut = model.max_tokens || model.max_completion_tokens || model.maxOutput || model.capabilities?.maxOutput;
+        const caps = (Number.isFinite(ctx) || Number.isFinite(maxOut)) ? {
+          ...(Number.isFinite(ctx) ? { contextWindow: ctx } : {}),
+          ...(Number.isFinite(maxOut) ? { maxOutput: maxOut } : {}),
+        } : undefined;
+        await onAddCustomModel(modelId, "llm", providerStorageAlias, caps);
         importedCount += 1;
       }
       if (importedCount === 0) {
