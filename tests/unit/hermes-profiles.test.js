@@ -8,6 +8,7 @@ import {
   resolveHermesHome,
   isProfileHome,
   listProfiles,
+  getHermesRoot,
 } from "../../src/app/api/cli-tools/hermes-settings/hermesProfiles.js";
 
 const BASE = "http://127.0.0.1:20128/v1";
@@ -26,6 +27,34 @@ afterEach(async () => {
 const write = (dir, file, content) => fs.writeFile(path.join(dir, file), content, "utf-8");
 
 describe("hermes profile resolution", () => {
+  describe("getHermesRoot", () => {
+    const origEnv = { ...process.env };
+
+    afterEach(() => {
+      process.env = { ...origEnv };
+    });
+
+    it("respects explicit root argument", () => {
+      expect(getHermesRoot("/custom/path")).toBe("/custom/path");
+    });
+
+    it("respects HERMES_HOME environment variable", () => {
+      process.env.HERMES_HOME = "/env/hermes/home";
+      expect(getHermesRoot()).toBe("/env/hermes/home");
+    });
+
+    it("resolves platform default", () => {
+      delete process.env.HERMES_HOME;
+      const root = getHermesRoot();
+      if (os.platform() === "win32") {
+        const expected = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "hermes");
+        expect(root).toBe(expected);
+      } else {
+        expect(root).toBe(path.join(os.homedir(), ".hermes"));
+      }
+    });
+  });
+
   describe("isValidProfileName", () => {
     it("accepts inert names", () => {
       for (const name of ["coder", "research-bot", "a", "A1_b2", "x".repeat(64)]) {

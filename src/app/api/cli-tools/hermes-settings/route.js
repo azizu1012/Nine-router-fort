@@ -91,7 +91,11 @@ const checkHermesInstalled = async () => {
   try {
     const isWindows = os.platform() === "win32";
     const command = isWindows ? "where hermes" : "which hermes";
-    await execAsync(command, { windowsHide: true });
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    const env = isWindows
+      ? { ...process.env, PATH: `${path.join(localAppData, "hermes", "bin")};${process.env.PATH}` }
+      : process.env;
+    await execAsync(command, { windowsHide: true, env });
     return true;
   } catch {
     try {

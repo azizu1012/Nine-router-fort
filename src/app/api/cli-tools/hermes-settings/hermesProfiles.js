@@ -16,7 +16,15 @@ import { parseModelBlock, parseDelegationBlock, parseAuxRoles, has9RouterConfig 
 export const PROFILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 export const IDENTITY_FILES = ["config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db"];
 
-export const getHermesRoot = (root) => root || path.join(os.homedir(), ".hermes");
+export const getHermesRoot = (root) => {
+  if (root) return root;
+  if (process.env.HERMES_HOME) return process.env.HERMES_HOME;
+  if (os.platform() === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "hermes");
+  }
+  return path.join(os.homedir(), ".hermes");
+};
 export const getProfilesRoot = (root) => path.join(getHermesRoot(root), "profiles");
 
 export const isValidProfileName = (name) =>
