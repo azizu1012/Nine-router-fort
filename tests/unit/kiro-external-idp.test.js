@@ -21,6 +21,7 @@ describe("Kiro external_idp (CLIProxyAPI) import and refresh", () => {
     vi.doUnmock("next/server");
     vi.doUnmock("@/models");
     vi.doUnmock("../../open-sse/utils/proxyFetch.js");
+    vi.doUnmock("undici");
     global.fetch = originalFetch;
   });
 
@@ -33,7 +34,11 @@ describe("Kiro external_idp (CLIProxyAPI) import and refresh", () => {
         expires_in: 3600,
       }),
     });
-    global.fetch = fetchMock;
+    // proxyFetch calls the package's own undici fetch, not global.fetch.
+    vi.doMock("undici", async () => {
+      const actual = await vi.importActual("undici");
+      return { ...actual, fetch: fetchMock };
+    });
 
     const { refreshKiroToken } = await import("../../open-sse/services/tokenRefresh.js");
     const result = await refreshKiroToken("old-refresh-token", {

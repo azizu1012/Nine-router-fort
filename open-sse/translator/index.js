@@ -111,6 +111,10 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     credentials._museContinuationEligible = sourceFormat !== FORMATS.OPENAI_RESPONSES;
   }
 
+  const translationOptions = {
+    preserveCacheControl: targetFormat === FORMATS.OPENAI && !!PROVIDERS[provider]?.quirks?.preserveCacheControl,
+  };
+
   // If same format, skip translation steps
   if (sourceFormat !== targetFormat) {
     // Direct route: if a translator is registered for this exact source:target
@@ -118,13 +122,13 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     // pairs like claude:kiro (avoids the claude->openai->kiro double-hop).
     const directFn = requestRegistry.get(`${sourceFormat}:${targetFormat}`);
     if (directFn) {
-      result = directFn(model, result, stream, credentials, provider);
+      result = directFn(model, result, stream, credentials, provider, translationOptions);
     } else {
       // Step 1: source -> openai (if source is not openai)
       if (sourceFormat !== FORMATS.OPENAI) {
         const toOpenAI = requestRegistry.get(`${sourceFormat}:${FORMATS.OPENAI}`);
         if (toOpenAI) {
-          result = toOpenAI(model, result, stream, credentials, provider);
+          result = toOpenAI(model, result, stream, credentials, provider, translationOptions);
           // Log OpenAI intermediate format
           reqLogger?.logOpenAIRequest?.(result);
         }
@@ -134,7 +138,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
       if (targetFormat !== FORMATS.OPENAI) {
         const fromOpenAI = requestRegistry.get(`${FORMATS.OPENAI}:${targetFormat}`);
         if (fromOpenAI) {
-          result = fromOpenAI(model, result, stream, credentials, provider);
+          result = fromOpenAI(model, result, stream, credentials, provider, translationOptions);
         }
       }
     }
@@ -161,9 +165,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // Always normalize to clean OpenAI format when target is OpenAI
   // This handles hybrid requests (e.g., OpenAI messages + Claude tools)
   if (targetFormat === FORMATS.OPENAI) {
-    result = filterToOpenAIFormat(result, {
-      preserveCacheControl: !!PROVIDERS[provider]?.quirks?.preserveCacheControl,
-    });
+    result = filterToOpenAIFormat(result, translationOptions);
   }
 
   // Final step: prepare request for Claude format endpoints

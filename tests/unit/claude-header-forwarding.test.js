@@ -266,24 +266,27 @@ describe("DefaultExecutor.buildHeaders() — anthropic-compatible stripping", ()
 describe("proxyAwareFetch — api.anthropic.com routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.doUnmock("undici");
   });
 
-  it("routes api.anthropic.com to gotScraping (non-streaming) and returns ok response", async () => {
-    // Mock got-scraping before module load
-    vi.doMock("got-scraping", () => {
-      const mockGotScraping = vi.fn().mockResolvedValue({
-        statusCode: 200,
-        statusMessage: "OK",
+  it("does not route api.anthropic.com through gotScraping (native undici handles DPI)", async () => {
+    const gotScrapingMock = vi.fn();
+    gotScrapingMock.stream = vi.fn();
+    vi.doMock("got-scraping", () => ({ gotScraping: gotScrapingMock }));
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "msg_test" }), {
+        status: 200,
         headers: { "content-type": "application/json" },
-        rawBody: Buffer.from(JSON.stringify({ id: "msg_test" })),
-      });
-      mockGotScraping.stream = vi.fn();
-      return { gotScraping: mockGotScraping };
+      })
+    );
+    vi.doMock("undici", async () => {
+      const actual = await vi.importActual("undici");
+      return { ...actual, fetch: fetchMock };
     });
 
     vi.resetModules();
     const { proxyAwareFetch } = await import("open-sse/utils/proxyFetch.js");
-    const { gotScraping } = await import("got-scraping");
 
     const res = await proxyAwareFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -292,29 +295,28 @@ describe("proxyAwareFetch — api.anthropic.com routing", () => {
       body: JSON.stringify({ model: "claude-3-5-sonnet-20241022", messages: [] }),
     });
 
-    expect(gotScraping).toHaveBeenCalledOnce();
+    // got-scraping was disabled upstream; the undici Agent carries the DPI-safe
+    // TLS curve now, so the native path must be used.
+    expect(gotScrapingMock).not.toHaveBeenCalled();
     expect(res.ok).toBe(true);
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(data.id).toBe("msg_test");
   });
 
-  it("falls back gracefully when got-scraping throws on non-streaming path", async () => {
+  it("keeps working when got-scraping throws on non-streaming path", async () => {
     vi.doMock("got-scraping", () => {
       const fn = vi.fn().mockRejectedValue(new Error("TLS error"));
       fn.stream = vi.fn();
       return { gotScraping: fn };
     });
 
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      headers: new Headers(),
-      body: null,
-      text: async () => "{}",
-      json: async () => ({}),
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+    );
+    vi.doMock("undici", async () => {
+      const actual = await vi.importActual("undici");
+      return { ...actual, fetch: fetchMock };
     });
 
     vi.resetModules();
@@ -327,21 +329,18 @@ describe("proxyAwareFetch — api.anthropic.com routing", () => {
     });
 
     expect(res.ok).toBe(true);
-    globalThis.fetch = originalFetch;
   });
 
   it("does NOT route non-Anthropic hosts through gotScraping", async () => {
     const gotScrapingMock = vi.fn();
     vi.doMock("got-scraping", () => ({ gotScraping: gotScrapingMock }));
 
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      headers: new Headers(),
-      body: null,
-      text: async () => "{}",
-      json: async () => ({}),
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+    );
+    vi.doMock("undici", async () => {
+      const actual = await vi.importActual("undici");
+      return { ...actual, fetch: fetchMock };
     });
 
     vi.resetModules();

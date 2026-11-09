@@ -17,13 +17,18 @@ function mockFetchOnce(payload, { ok = true, status = 200 } = {}) {
     json: () => Promise.resolve(payload),
     text: () => Promise.resolve(JSON.stringify(payload)),
   });
-  global.fetch = fn;
+  // proxyFetch now calls the package's own undici fetch, so mock that module
+  // instead of global.fetch (which proxyFetch replaces at import time).
+  vi.doMock("undici", async () => {
+    const actual = await vi.importActual("undici");
+    return { ...actual, fetch: fn };
+  });
   return fn;
 }
 
 describe("refreshAccessToken — config-driven profiles", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.resetModules(); global.fetch = originalFetch; });
-  afterEach(() => { global.fetch = originalFetch; vi.unstubAllEnvs(); });
+  afterEach(() => { global.fetch = originalFetch; vi.doUnmock("undici"); vi.unstubAllEnvs(); });
 
   it("iflow: Basic Auth header from clientId:clientSecret, form body keeps client_secret", async () => {
     // iFlow credentials are env-only in this fork; stub them before the config
@@ -108,7 +113,7 @@ describe("refreshAccessToken — config-driven profiles", () => {
 });
 describe("Cline refresh", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.resetModules(); global.fetch = originalFetch; });
-  afterEach(() => { global.fetch = originalFetch; });
+  afterEach(() => { global.fetch = originalFetch; vi.doUnmock("undici"); });
 
   it("uses the extension JSON refresh contract", async () => {
     const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();

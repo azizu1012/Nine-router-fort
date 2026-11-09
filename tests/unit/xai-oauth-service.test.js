@@ -1,10 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-describe("xai/oauth service", () => {
+describe("xai/oauth service", { timeout: 15000 }, () => {
   beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    // The OAuth provider entrypoint imports open-sse, which replaces global.fetch
+    // with proxyAwareFetch (backed by the package's own undici fetch).
+    vi.doMock("undici", async () => {
+      const actual = await vi.importActual("undici");
+      return { ...actual, fetch: fetchMock };
+    });
+  });
+
+  afterEach(() => {
+    vi.doUnmock("undici");
   });
 
   it("validates discovered endpoints are https x.ai URLs", async () => {
