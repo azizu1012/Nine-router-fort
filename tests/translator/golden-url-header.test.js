@@ -30,7 +30,7 @@ const VOLATILE_HEADERS = new Set(["x-msh-device-name", "x-mavis-session-id"]);
 // snapshot stays green across releases and across Linux CI vs Windows dev —
 // otherwise every version bump or platform switch rewrites these entries.
 const ENV_HEADERS = new Map([
-  ["user-agent", (v) => v.replace(/9Router\/[\w.-]+/g, "9Router/<VERSION>")],
+  ["user-agent", (v) => v.replace(/9Router\/[\w.-]+/g, "9Router/<VERSION>").replace(/claude-cli\/[\w.-]+/g, "claude-cli/<VERSION>")],
   ["x-client-version", () => "<VERSION>"],
   ["x-core-version", () => "<VERSION>"],
   ["x-msh-version", () => "<VERSION>"],
